@@ -153,8 +153,19 @@ pub(crate) mod ext {
 /// import the module.
 #[pymodule(name = "exo_pyo3_bindings")]
 fn main_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // install logger
-    pyo3_log::init();
+    // install tracing subscriber to capture libp2p internal logs (mdns debug)
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("libp2p_mdns=debug,libp2p_swarm=info")
+                }),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    // NOTE: pyo3_log::init() skipped - conflicts with tracing-subscriber
+    // pyo3_log::init();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     pyo3_async_runtimes::tokio::init(builder);
@@ -164,9 +175,6 @@ fn main_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     //       too many importing issues...
     m.add_class::<PyKeypair>()?;
     networking_submodule(m)?;
-
-    // top-level constructs
-    // TODO: ...
 
     Ok(())
 }

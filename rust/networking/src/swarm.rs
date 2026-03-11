@@ -116,6 +116,49 @@ fn on_message(swarm: &mut libp2p::Swarm<Behaviour>, message: ToSwarm) {
 }
 
 fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
+    // DIAGNOSTIC: print ALL swarm events to stderr
+    match &event {
+        SwarmEvent::NewListenAddr { address, .. } => {
+            eprintln!("[DIAG] SwarmEvent::NewListenAddr => {address}");
+        }
+        SwarmEvent::ListenerError { error, .. } => {
+            eprintln!("[DIAG] SwarmEvent::ListenerError => {error}");
+        }
+        SwarmEvent::ListenerClosed { reason, .. } => {
+            eprintln!("[DIAG] SwarmEvent::ListenerClosed => {reason:?}");
+        }
+        SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
+            eprintln!("[DIAG] SwarmEvent::IncomingConnection local={local_addr} remote={send_back_addr}");
+        }
+        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            eprintln!("[DIAG] SwarmEvent::ConnectionEstablished peer={peer_id} endpoint={endpoint:?}");
+        }
+        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            eprintln!("[DIAG] SwarmEvent::ConnectionClosed peer={peer_id} cause={cause:?}");
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            eprintln!("[DIAG] SwarmEvent::OutgoingConnectionError peer={peer_id:?} error={error}");
+        }
+        SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, error, .. } => {
+            eprintln!("[DIAG] SwarmEvent::IncomingConnectionError local={local_addr} remote={send_back_addr} error={error}");
+        }
+        SwarmEvent::Dialing { peer_id, .. } => {
+            eprintln!("[DIAG] SwarmEvent::Dialing peer={peer_id:?}");
+        }
+        SwarmEvent::Behaviour(be) => match be {
+            BehaviourEvent::Discovery(de) => {
+                eprintln!("[DIAG] SwarmEvent::Behaviour::Discovery => {de:?}");
+            }
+            BehaviourEvent::Gossipsub(ge) => match ge {
+                gossipsub::Event::Message { .. } => {} // too noisy
+                other => { eprintln!("[DIAG] SwarmEvent::Behaviour::Gossipsub => {other:?}"); }
+            },
+        },
+        other => {
+            eprintln!("[DIAG] SwarmEvent::Other => {other:?}");
+        }
+    }
+
     match event {
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message:
@@ -142,7 +185,10 @@ fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
     }
 }
 
-/// Create and configure a swarm which listens to all ports on OS
+/// Fixed port for exo's libp2p swarm, enabling static peer discovery.
+pub const EXO_SWARM_PORT: u16 = 52416;
+
+/// Create and configure a swarm which listens on the fixed EXO_SWARM_PORT.
 pub fn create_swarm(
     keypair: identity::Keypair,
     from_client: mpsc::Receiver<ToSwarm>,
@@ -153,8 +199,9 @@ pub fn create_swarm(
         .with_behaviour(Behaviour::new)?
         .build();
 
-    // Listen on all interfaces and whatever port the OS assigns
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    // Listen on all interfaces on the fixed exo swarm port
+    let listen_addr = format!("/ip4/0.0.0.0/tcp/{EXO_SWARM_PORT}");
+    swarm.listen_on(listen_addr.parse()?)?;
     Ok(Swarm { swarm, from_client })
 }
 

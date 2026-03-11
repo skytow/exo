@@ -292,6 +292,7 @@ exo supports several environment variables for configuration:
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
+| `EXO_STATIC_PEERS` | Comma-separated IP addresses of peers to connect to directly (bypasses mDNS) | None |
 
 **Example usage:**
 
@@ -307,7 +308,28 @@ EXO_ENABLE_IMAGE_MODELS=true uv run exo
 
 # Use custom namespace for cluster isolation
 EXO_LIBP2P_NAMESPACE=my-dev-cluster uv run exo
+
+# Connect to specific peers (useful when mDNS discovery fails)
+EXO_STATIC_PEERS=192.168.1.42,192.168.1.43 uv run exo
 ```
+
+---
+
+### Static Peer Discovery
+
+exo normally discovers devices automatically via mDNS. However, on some macOS configurations (especially with multiple network interfaces, VPNs like Tailscale, or when the system mDNSResponder interferes), automatic discovery may fail.
+
+In these cases, use the `EXO_STATIC_PEERS` environment variable to specify peer IP addresses directly:
+
+```bash
+# On machine A (192.168.1.35), point to machine B:
+EXO_STATIC_PEERS=192.168.1.42,192.168.1.43 uv run exo
+
+# On machine B (192.168.1.42), point to machine A:
+EXO_STATIC_PEERS=192.168.1.35,192.168.1.36 uv run exo
+```
+
+All exo nodes listen on TCP port **52416** for peer connections. Static peer dialing runs alongside mDNS — whichever discovers the peer first wins. Once a connection is established, static dialing stops retrying.
 
 ---
 

@@ -1,4 +1,5 @@
 use crate::ext::MultiaddrExt;
+use crate::swarm::EXO_SWARM_PORT;
 use delegate::delegate;
 use either::Either;
 use futures_lite::FutureExt;
@@ -17,11 +18,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use util::wakerdeque::WakerDeque;
 
+static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
+static MANAGED_READY_COUNT: AtomicU64 = AtomicU64::new(0);
+
 const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
+const STATIC_PEER_DIAL_INTERVAL: Duration = Duration::from_secs(5);
 
 mod managed {
     use libp2p::swarm::NetworkBehaviour;
@@ -29,8 +35,8 @@ mod managed {
     use std::io;
     use std::time::Duration;
 
-    const MDNS_RECORD_TTL: Duration = Duration::from_secs(2_500);
-    const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(1_500);
+    const MDNS_RECORD_TTL: Duration = Duration::from_secs(300);
+    const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(5);
     const PING_TIMEOUT: Duration = Duration::from_millis(2_500);
     const PING_INTERVAL: Duration = Duration::from_millis(2_500);
 
@@ -52,6 +58,8 @@ mod managed {
     fn mdns_behaviour(keypair: &identity::Keypair) -> io::Result<mdns::tokio::Behaviour> {
         use mdns::{Config, tokio};
 
+        let peer_id = keypair.public().to_peer_id();
+
         // mDNS config => enable IPv6
         let mdns_config = Config {
             ttl: MDNS_RECORD_TTL,
@@ -61,8 +69,7 @@ mod managed {
             ..Default::default()
         };
 
-        let mdns_behaviour = tokio::Behaviour::new(mdns_config, keypair.public().to_peer_id());
-        Ok(mdns_behaviour?)
+        Ok(tokio::Behaviour::new(mdns_config, peer_id)?)
     }
 
     fn ping_behaviour() -> ping::Behaviour {
@@ -106,6 +113,12 @@ pub struct Behaviour {
     mdns_discovered: HashMap<PeerId, BTreeSet<Multiaddr>>,
 
     retry_delay: Delay, // retry interval
+    diag_last_print: Instant, // diagnostic timer
+
+    // Static peer addresses from EXO_STATIC_PEERS env var (fallback when mDNS fails)
+    static_peer_addrs: Vec<Multiaddr>,
+    static_peer_delay: Delay,
+    has_any_connection: bool,
 
     // pending events to emmit => waker-backed Deque to control polling
     pending_events: WakerDeque<ToSwarm<Event, Infallible>>,
@@ -113,10 +126,37 @@ pub struct Behaviour {
 
 impl Behaviour {
     pub fn new(keypair: &identity::Keypair) -> io::Result<Self> {
+        // Parse EXO_STATIC_PEERS env var: comma-separated IP addresses for manual peer discovery.
+        // This is a fallback for when mDNS discovery fails (e.g. macOS mDNSResponder interference).
+        let static_peer_addrs: Vec<Multiaddr> = std::env::var("EXO_STATIC_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                let ma: Multiaddr = format!("/ip4/{s}/tcp/{EXO_SWARM_PORT}").parse().ok()?;
+                Some(ma)
+            })
+            .collect();
+
+        if !static_peer_addrs.is_empty() {
+            log::info!(
+                "Loaded {} static peer addresses: {:?}",
+                static_peer_addrs.len(),
+                static_peer_addrs
+            );
+        }
+
         Ok(Self {
             managed: managed::Behaviour::new(keypair)?,
             mdns_discovered: HashMap::new(),
             retry_delay: Delay::new(RETRY_CONNECT_INTERVAL),
+            diag_last_print: Instant::now(),
+            static_peer_addrs,
+            static_peer_delay: Delay::new(STATIC_PEER_DIAL_INTERVAL),
+            has_any_connection: false,
             pending_events: WakerDeque::new(),
         })
     }
@@ -136,6 +176,7 @@ impl Behaviour {
     }
 
     fn handle_mdns_discovered(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
+        log::info!("mDNS discovered {} peers: {:?}", peers.len(), peers);
         for (p, ma) in peers {
             self.dial(p, ma.clone()); // always connect
 
@@ -152,6 +193,7 @@ impl Behaviour {
     }
 
     fn handle_mdns_expired(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
+        log::info!("mDNS expired {} peers: {:?}", peers.len(), peers);
         for (p, ma) in peers {
             // at this point, we *must* have the peer
             let mas = self
@@ -170,6 +212,12 @@ impl Behaviour {
         }
     }
 
+    fn dial_unknown_peer(&mut self, addr: Multiaddr) {
+        self.pending_events.push_back(ToSwarm::Dial {
+            opts: DialOpts::unknown_peer_id().address(addr).build(),
+        })
+    }
+
     fn on_connection_established(
         &mut self,
         peer_id: PeerId,
@@ -177,6 +225,7 @@ impl Behaviour {
         remote_ip: IpAddr,
         remote_tcp_port: u16,
     ) {
+        self.has_any_connection = true;
         // send out connected event
         self.pending_events
             .push_back(ToSwarm::GenerateEvent(Event::ConnectionEstablished {
@@ -323,9 +372,23 @@ impl NetworkBehaviour for Behaviour {
     }
 
     fn poll(&mut self, cx: &mut Context) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        let pc = POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        // periodic status logging
+        if self.diag_last_print.elapsed() >= Duration::from_secs(30) {
+            let mr = MANAGED_READY_COUNT.load(Ordering::Relaxed);
+            log::debug!(
+                "discovery::poll status: poll_count={pc}, managed_ready_count={mr}, mdns_discovered={}, has_connection={}",
+                self.mdns_discovered.len(),
+                self.has_any_connection
+            );
+            self.diag_last_print = Instant::now();
+        }
+
         // delegate to managed behaviors for any behaviors they need to perform
         match self.managed.poll(cx) {
             Poll::Ready(ToSwarm::GenerateEvent(e)) => {
+                MANAGED_READY_COUNT.fetch_add(1, Ordering::Relaxed);
                 match e {
                     // handle discovered and expired events from mDNS
                     managed::BehaviourEvent::Mdns(e) => match e.clone() {
@@ -369,6 +432,21 @@ impl NetworkBehaviour for Behaviour {
                 }
             }
             self.retry_delay.reset(RETRY_CONNECT_INTERVAL) // reset timeout
+        }
+
+        // Static peer fallback: if no connections and we have static peers, try dialing them
+        if !self.static_peer_addrs.is_empty()
+            && !self.has_any_connection
+            && self.static_peer_delay.poll(cx).is_ready()
+        {
+            log::info!(
+                "No connections yet, dialing {} static peers",
+                self.static_peer_addrs.len()
+            );
+            for addr in self.static_peer_addrs.clone() {
+                self.dial_unknown_peer(addr);
+            }
+            self.static_peer_delay.reset(STATIC_PEER_DIAL_INTERVAL);
         }
 
         // send out any pending events from our own service

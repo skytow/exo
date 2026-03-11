@@ -40,3 +40,4 @@ log = { workspace = true }
 # networking
 libp2p = { workspace = true, features = ["full"] }
 pin-project = "1.1.10"
+socket2 = "0.5"

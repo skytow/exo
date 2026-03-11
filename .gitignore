@@ -3,6 +3,8 @@ digest.txt
 
 # python
 **/__pycache__
+*.egg-info/
+exo.egg-info/
 
 # nix
 .direnv/
