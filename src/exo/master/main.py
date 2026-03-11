@@ -60,6 +60,7 @@ from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
 from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.runners import RunnerFailed
 from exo.utils.channels import Receiver, Sender
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
@@ -366,6 +367,20 @@ class Master:
             for instance_id, instance in self.state.instances.items():
                 for node_id in instance.shard_assignments.node_to_runner:
                     if node_id not in connected_node_ids:
+                        await self.event_sender.send(
+                            InstanceDeleted(instance_id=instance_id)
+                        )
+                        break
+
+            # delete instances whose runners have permanently failed
+            for instance_id, instance in self.state.instances.items():
+                for runner_id in instance.shard_assignments.runner_to_shard:
+                    runner_status = self.state.runners.get(runner_id)
+                    if isinstance(runner_status, RunnerFailed):
+                        logger.info(
+                            f"Deleting instance {instance_id} due to failed runner "
+                            f"{runner_id}: {runner_status.error_message}"
+                        )
                         await self.event_sender.send(
                             InstanceDeleted(instance_id=instance_id)
                         )

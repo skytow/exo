@@ -17,6 +17,8 @@ from exo.shared.types.worker.shards import (
     TensorShardMetadata,
 )
 
+TWO_NODE_PIPELINE_MAX_SHARE = 0.6
+
 
 def filter_cycles_by_memory(
     cycles: list[Cycle],
@@ -92,20 +94,29 @@ def _compute_total_memory(
         raise ValueError("Cannot create shard assignments: total available memory is 0")
     return total_memory
 
+def _cap_two_node_memory_fractions(
+    memory_fractions: list[float],
+) -> list[float]:
+    if len(memory_fractions) != 2:
+        return memory_fractions
 
-def _allocate_and_validate_layers(
+    max_idx = max(range(len(memory_fractions)), key=lambda i: memory_fractions[i])
+    if memory_fractions[max_idx] <= TWO_NODE_PIPELINE_MAX_SHARE:
+        return memory_fractions
+
+    min_idx = 1 - max_idx
+    capped = list(memory_fractions)
+    capped[max_idx] = TWO_NODE_PIPELINE_MAX_SHARE
+    capped[min_idx] = 1 - TWO_NODE_PIPELINE_MAX_SHARE
+    return capped
+
+
+def _validate_layer_allocations_fit(
     node_ids: list[NodeId],
     node_memory: Mapping[NodeId, MemoryUsage],
-    total_memory: Memory,
     model_card: ModelCard,
-) -> list[int]:
-    layer_allocations = allocate_layers_proportionally(
-        total_layers=model_card.n_layers,
-        memory_fractions=[
-            node_memory[node_id].ram_available / total_memory for node_id in node_ids
-        ],
-    )
-
+    layer_allocations: list[int],
+) -> None:
     total_storage = model_card.storage_size
     total_layers = model_card.n_layers
     for i, node_id in enumerate(node_ids):
@@ -119,7 +130,42 @@ def _allocate_and_validate_layers(
                 f"but only has {available_memory.in_gb:.2f} GB available"
             )
 
-    return layer_allocations
+
+def _allocate_and_validate_layers(
+    node_ids: list[NodeId],
+    node_memory: Mapping[NodeId, MemoryUsage],
+    total_memory: Memory,
+    model_card: ModelCard,
+) -> list[int]:
+    raw_memory_fractions = [
+        node_memory[node_id].ram_available / total_memory for node_id in node_ids
+    ]
+    capped_memory_fractions = _cap_two_node_memory_fractions(raw_memory_fractions)
+    candidate_memory_fractions = (
+        [capped_memory_fractions, raw_memory_fractions]
+        if capped_memory_fractions != raw_memory_fractions
+        else [raw_memory_fractions]
+    )
+
+    last_error: ValueError | None = None
+    for memory_fractions in candidate_memory_fractions:
+        layer_allocations = allocate_layers_proportionally(
+            total_layers=model_card.n_layers,
+            memory_fractions=memory_fractions,
+        )
+        try:
+            _validate_layer_allocations_fit(
+                node_ids=node_ids,
+                node_memory=node_memory,
+                model_card=model_card,
+                layer_allocations=layer_allocations,
+            )
+            return layer_allocations
+        except ValueError as exc:
+            last_error = exc
+
+    assert last_error is not None
+    raise last_error
 
 
 def get_shard_assignments_for_pipeline_parallel(

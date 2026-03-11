@@ -29,6 +29,13 @@ exo connects all your devices into an AI cluster. Not only does exo enable runni
 - **Multiple API Compatibility**: Compatible with OpenAI Chat Completions API, Claude Messages API, OpenAI Responses API, and Ollama API - use your existing tools and clients.
 - **Custom Model Support**: Load custom models from HuggingFace hub to expand the range of available models.
 
+### Placement Notes
+
+- **Pipeline sharding** splits contiguous layer ranges across nodes.
+- **Tensor sharding** keeps the full layer range on every participating node and shards each layer across devices instead.
+- On **2-node pipeline** placements, exo now biases the larger-memory node while capping the split to roughly **60/40** when both nodes can support it. This avoids over-skewing toward the largest machine while still taking advantage of asymmetric RAM capacity.
+- If the smaller node cannot safely hold the 40% share, exo falls back to the raw memory-based allocation that fits.
+
 ## Dashboard
 
 exo includes a built-in dashboard for managing your cluster and chatting with models.

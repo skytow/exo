@@ -437,6 +437,95 @@ class TestAllocateLayersProportionally:
         assert result == [1, 1, 1]
         assert sum(result) == 3
 
+def test_get_shard_assignments_two_node_pipeline_caps_at_sixty_forty():
+    node_a_id = NodeId()
+    node_b_id = NodeId()
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+    topology.add_connection(
+        Connection(source=node_a_id, sink=node_b_id, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b_id, sink=node_a_id, edge=create_socket_connection(2))
+    )
+
+    node_memory = {
+        node_a_id: create_node_memory(9000 * 1024),
+        node_b_id: create_node_memory(1000 * 1024),
+    }
+    model_card = ModelCard(
+        model_id=ModelId("test-model"),
+        n_layers=10,
+        storage_size=Memory.from_kb(1000),
+        hidden_size=1000,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+    )
+    selected_cycle = next(cycle for cycle in topology.get_cycles() if len(cycle) == 2)
+
+    shard_assignments = get_shard_assignments(
+        model_card, selected_cycle, Sharding.Pipeline, node_memory=node_memory
+    )
+
+    runner_id_a = shard_assignments.node_to_runner[node_a_id]
+    runner_id_b = shard_assignments.node_to_runner[node_b_id]
+    layers_a = (
+        shard_assignments.runner_to_shard[runner_id_a].end_layer
+        - shard_assignments.runner_to_shard[runner_id_a].start_layer
+    )
+    layers_b = (
+        shard_assignments.runner_to_shard[runner_id_b].end_layer
+        - shard_assignments.runner_to_shard[runner_id_b].start_layer
+    )
+
+    assert (layers_a, layers_b) == (6, 4)
+
+
+def test_get_shard_assignments_two_node_pipeline_falls_back_when_sixty_forty_wont_fit():
+    node_a_id = NodeId()
+    node_b_id = NodeId()
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+    topology.add_connection(
+        Connection(source=node_a_id, sink=node_b_id, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_b_id, sink=node_a_id, edge=create_socket_connection(2))
+    )
+
+    node_memory = {
+        node_a_id: create_node_memory(1900 * 1024),
+        node_b_id: create_node_memory(100 * 1024),
+    }
+    model_card = ModelCard(
+        model_id=ModelId("test-model"),
+        n_layers=10,
+        storage_size=Memory.from_kb(1000),
+        hidden_size=1000,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+    )
+    selected_cycle = next(cycle for cycle in topology.get_cycles() if len(cycle) == 2)
+
+    shard_assignments = get_shard_assignments(
+        model_card, selected_cycle, Sharding.Pipeline, node_memory=node_memory
+    )
+
+    runner_id_a = shard_assignments.node_to_runner[node_a_id]
+    runner_id_b = shard_assignments.node_to_runner[node_b_id]
+    layers_a = (
+        shard_assignments.runner_to_shard[runner_id_a].end_layer
+        - shard_assignments.runner_to_shard[runner_id_a].start_layer
+    )
+    layers_b = (
+        shard_assignments.runner_to_shard[runner_id_b].end_layer
+        - shard_assignments.runner_to_shard[runner_id_b].start_layer
+    )
+
+    assert (layers_a, layers_b) == (9, 1)
+
 
 def test_get_shard_assignments_insufficient_memory_raises():
     """Test that ValueError is raised when a node has insufficient memory for its layers."""
