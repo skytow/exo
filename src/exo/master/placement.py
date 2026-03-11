@@ -11,6 +11,7 @@ from exo.master.placement_utils import (
     get_mlx_ring_hosts_by_node,
     get_shard_assignments,
     get_smallest_cycles,
+    rotate_cycle_to_reachable_jaccl_coordinator,
 )
 from exo.shared.models.model_cards import ModelId
 from exo.shared.topology import Topology
@@ -132,6 +133,12 @@ def place_instance(
             start=Memory(),
         ),
     )
+    if command.instance_meta == InstanceMeta.MlxJaccl and len(selected_cycle) > 1:
+        selected_cycle = rotate_cycle_to_reachable_jaccl_coordinator(
+            selected_cycle=selected_cycle,
+            cycle_digraph=topology.get_subgraph_from_nodes(selected_cycle.node_ids),
+            node_network=node_network,
+        )
 
     # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node)
     if len(selected_cycle) == 1:

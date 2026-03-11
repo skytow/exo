@@ -1,7 +1,7 @@
 from copy import copy
 from itertools import count
 from math import inf
-from os import PathLike
+from os import PathLike, fsdecode
 from pathlib import Path
 from typing import cast
 
@@ -241,15 +241,15 @@ def get_node_id_keypair(
     Obtains the :class:`Keypair` associated with this node-ID.
     Obtain the :class:`PeerId` by from it.
     """
-    # TODO(evan): bring back node id persistence once we figure out how to deal with duplicates
-    return Keypair.generate()
+    keypair_path = Path(fsdecode(path))
+    keypair_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def lock_path(path: str | bytes | PathLike[str] | PathLike[bytes]) -> Path:
+    def lock_path(path: Path) -> Path:
         return Path(str(path) + ".lock")
 
     # operate with cross-process lock to avoid race conditions
-    with FileLock(lock_path(path)):
-        with open(path, "a+b") as f:  # opens in append-mode => starts at EOF
+    with FileLock(lock_path(keypair_path)):
+        with open(keypair_path, "a+b") as f:  # opens in append-mode => starts at EOF
             # if non-zero EOF, then file exists => use to get node-ID
             if f.tell() != 0:
                 f.seek(0)  # go to start & read protobuf-encoded bytes
@@ -261,7 +261,7 @@ def get_node_id_keypair(
                     logger.warning(f"Encountered error when trying to get keypair: {e}")
 
         # if no valid credentials, create new ones and persist
-        with open(path, "w+b") as f:
+        with open(keypair_path, "w+b") as f:
             keypair = Keypair.generate()
             f.write(keypair.to_bytes())
             return keypair

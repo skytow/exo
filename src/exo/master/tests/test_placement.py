@@ -463,6 +463,74 @@ def test_tensor_rdma_backend_connectivity_matrix(
             ip_part = coordinator.split(":")[0]
             assert len(ip_part.split(".")) == 4
 
+def test_mlx_jaccl_prefers_reachable_rank_zero_in_asymmetric_socket_topology(
+    model_card: ModelCard,
+):
+    topology = Topology()
+    model_card.n_layers = 10
+    model_card.storage_size = Memory.from_bytes(1200)
+
+    node_a = NodeId()
+    node_b = NodeId()
+
+    node_memory = {
+        node_a: create_node_memory(700),
+        node_b: create_node_memory(700),
+    }
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[NetworkInterfaceInfo(name="en0", ip_address="169.254.0.1")]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[NetworkInterfaceInfo(name="en0", ip_address="169.254.0.2")]
+        ),
+    }
+
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_rdma_connection(3))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_rdma_connection(3))
+    )
+    topology.add_connection(
+        Connection(
+            source=node_a,
+            sink=node_b,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/169.254.0.2/tcp/1234")
+            ),
+        )
+    )
+
+    cic = PlaceInstance(
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=1,
+    )
+
+    placements = place_instance(cic, topology, {}, node_memory, node_network)
+
+    assert len(placements) == 1
+    instance = list(placements.values())[0]
+    assert isinstance(instance, MlxJacclInstance)
+
+    runner_a = instance.shard_assignments.node_to_runner[node_a]
+    runner_b = instance.shard_assignments.node_to_runner[node_b]
+    shard_a = instance.shard_assignments.runner_to_shard[runner_a]
+    shard_b = instance.shard_assignments.runner_to_shard[runner_b]
+
+    assert shard_b.device_rank == 0
+    assert shard_a.device_rank == 1
+    assert instance.jaccl_coordinators[node_b].startswith("0.0.0.0:")
+
+    coordinator_ip, coordinator_port = instance.jaccl_coordinators[node_a].split(":")
+    assert coordinator_ip == "169.254.0.2"
+    assert instance.jaccl_coordinators[node_b].endswith(f":{coordinator_port}")
+
 
 def _make_task(
     instance_id: InstanceId,

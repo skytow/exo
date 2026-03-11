@@ -366,16 +366,46 @@ def _find_ip_prioritised(
             "unknown": 4,
         }
 
-    # RDMA prefers ethernet coordinator
+    # JACCL coordinator must be reachable over the RDMA-capable (Thunderbolt) path
     else:
         priority = {
-            "ethernet": 0,
-            "wifi": 1,
-            "unknown": 2,
-            "maybe_ethernet": 3,
-            "thunderbolt": 4,
+            "thunderbolt": 0,
+            "maybe_ethernet": 1,
+            "ethernet": 2,
+            "wifi": 3,
+            "unknown": 4,
         }
     return min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2))
+
+def rotate_cycle_to_reachable_jaccl_coordinator(
+    selected_cycle: Cycle,
+    cycle_digraph: Topology,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> Cycle:
+    """Rotate a JACCL cycle so rank 0 is reachable by every other participant."""
+    if len(selected_cycle) <= 1:
+        return selected_cycle
+
+    for offset in range(len(selected_cycle.node_ids)):
+        candidate_node_ids = (
+            selected_cycle.node_ids[offset:] + selected_cycle.node_ids[:offset]
+        )
+        coordinator = candidate_node_ids[0]
+        if all(
+            node_id == coordinator
+            or _find_ip_prioritised(
+                node_id=node_id,
+                other_node_id=coordinator,
+                cycle_digraph=cycle_digraph,
+                node_network=node_network,
+                ring=False,
+            )
+            is not None
+            for node_id in candidate_node_ids
+        ):
+            return Cycle(node_ids=candidate_node_ids)
+
+    return selected_cycle
 
 
 def get_mlx_ring_hosts_by_node(

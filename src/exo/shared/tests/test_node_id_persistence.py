@@ -6,27 +6,27 @@ from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue as QueueT
 from multiprocessing.synchronize import Event as EventT
 from multiprocessing.synchronize import Semaphore as SemaphoreT
+from pathlib import Path
 
 from loguru import logger
-from pytest import LogCaptureFixture, mark
+from pytest import LogCaptureFixture
 
 from exo.routing.router import get_node_id_keypair
-from exo.shared.constants import EXO_NODE_ID_KEYPAIR
 
 NUM_CONCURRENT_PROCS = 10
 
 
 def _get_keypair_concurrent_subprocess_task(
-    sem: SemaphoreT, ev: EventT, queue: QueueT[bytes]
+    sem: SemaphoreT, ev: EventT, queue: QueueT[bytes], path: str
 ) -> None:
     # synchronise with parent process
     sem.release()
     # wait to be told to begin simultaneous read
     ev.wait()
-    queue.put(get_node_id_keypair().to_bytes())
+    queue.put(get_node_id_keypair(path).to_bytes())
 
 
-def _get_keypair_concurrent(num_procs: int) -> bytes:
+def _get_keypair_concurrent(num_procs: int, path: Path) -> bytes:
     assert num_procs > 0
 
     sem = Semaphore(0)
@@ -38,7 +38,8 @@ def _get_keypair_concurrent(num_procs: int) -> bytes:
     ps: list[BaseProcess] = []
     for _ in range(num_procs):
         p = multiprocessing.get_context("fork").Process(
-            target=_get_keypair_concurrent_subprocess_task, args=(sem, ev, queue)
+            target=_get_keypair_concurrent_subprocess_task,
+            args=(sem, ev, queue, str(path)),
         )
         ps.append(p)
         p.start()
@@ -74,20 +75,23 @@ def _delete_if_exists(p: str | bytes | os.PathLike[str] | os.PathLike[bytes]):
         os.remove(p)
 
 
-@mark.skip(reason="this functionality is currently disabled but may return in future")
-def test_node_id_fetching(caplog: LogCaptureFixture):
+def test_node_id_fetching(caplog: LogCaptureFixture, tmp_path: Path):
     reps = 10
+    keypair_path = tmp_path / "node_id.keypair"
+    keypair_lock_path = Path(str(keypair_path) + ".lock")
 
     # delete current file and write a new one
-    _delete_if_exists(EXO_NODE_ID_KEYPAIR)
-    kp = _get_keypair_concurrent(NUM_CONCURRENT_PROCS)
+    _delete_if_exists(keypair_path)
+    _delete_if_exists(keypair_lock_path)
+    kp = _get_keypair_concurrent(NUM_CONCURRENT_PROCS, keypair_path)
 
     with caplog.at_level(101):  # supress logs
         # make sure that continuous fetches return the same value
         for _ in range(reps):
-            assert kp == _get_keypair_concurrent(NUM_CONCURRENT_PROCS)
+            assert kp == _get_keypair_concurrent(NUM_CONCURRENT_PROCS, keypair_path)
 
         # make sure that after deleting, we are not fetching the same value
-        _delete_if_exists(EXO_NODE_ID_KEYPAIR)
+        _delete_if_exists(keypair_path)
+        _delete_if_exists(keypair_lock_path)
         for _ in range(reps):
-            assert kp != _get_keypair_concurrent(NUM_CONCURRENT_PROCS)
+            assert kp != _get_keypair_concurrent(NUM_CONCURRENT_PROCS, keypair_path)
