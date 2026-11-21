@@ -23,18 +23,18 @@ def filter_cycles_by_memory(
     node_memory: Mapping[NodeId, MemoryUsage],
     required_memory: Memory,
 ) -> list[Cycle]:
-    # In bytes: summing Memory objects over every cycle of a large cluster (16,000 for 8
-    # nodes) made this the costliest part of placing a model
-    free = {
-        node_id: usage.ram_available.in_bytes for node_id, usage in node_memory.items()
-    }
-    required = required_memory.in_bytes
-    return [
-        cycle
-        for cycle in cycles
-        if all(node in free for node in cycle)
-        and sum(free[node_id] for node_id in cycle.node_ids) >= required
-    ]
+    filtered_cycles: list[Cycle] = []
+    for cycle in cycles:
+        if not all(node in node_memory for node in cycle):
+            continue
+
+        total_mem = sum(
+            (node_memory[node_id].ram_available for node_id in cycle.node_ids),
+            start=Memory(),
+        )
+        if total_mem >= required_memory:
+            filtered_cycles.append(cycle)
+    return filtered_cycles
 
 
 def get_smallest_cycles(
@@ -106,7 +106,7 @@ def _allocate_and_validate_layers(
         ],
     )
 
-    total_storage = model_card.resident_size
+    total_storage = model_card.storage_size
     total_layers = model_card.n_layers
     for i, node_id in enumerate(node_ids):
         node_layers = layer_allocations[i]
@@ -336,7 +336,53 @@ def _find_connection_ip(
             yield connection.sink_multiaddr.ip_address
 
 
-def find_ip_prioritised(
+def _ip_from_rdma(
+    node_j: NodeId,
+    cycle_digraph: Topology,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> str | None:
+    """Derive node_j's IP from an RDMAConnection.
+    Prefers LAN IP (ethernet/wifi) over Thunderbolt link-local for TCP ring backend
+    compatibility, since MLX ring sockets may fail to route to link-local destinations
+    on multi-homed hosts."""
+    other_network = node_network.get(node_j, NodeNetworkInfo())
+    # First pass: prefer non-link-local IPs (LAN) for ring TCP compatibility
+    for conn in cycle_digraph.list_connections():
+        if not isinstance(conn.edge, RDMAConnection):
+            continue
+        if conn.sink != node_j and conn.source != node_j:
+            continue
+        # Node_j is reachable via RDMA (Thunderbolt), so it's on the network.
+        # Return its best LAN IP instead of the link-local TB IP.
+        # Exclude link-local, loopback, and IPv6 — MLX ring only supports IPv4.
+        for iface in other_network.interfaces:
+            ip = iface.ip_address
+            if (
+                ip
+                and ":" not in ip
+                and not ip.startswith("169.254.")
+                and not ip.startswith("127.")
+            ):
+                return iface.ip_address
+    # Fallback: Thunderbolt link-local IP
+    for conn in cycle_digraph.list_connections():
+        if not isinstance(conn.edge, RDMAConnection):
+            continue
+        rdma_iface = (
+            conn.edge.sink_rdma_iface if conn.sink == node_j
+            else conn.edge.source_rdma_iface if conn.source == node_j
+            else None
+        )
+        if rdma_iface is None:
+            continue
+        base_iface = rdma_iface.removeprefix("rdma_")
+        for iface in other_network.interfaces:
+            if iface.name == base_iface and iface.ip_address:
+                return iface.ip_address
+    return None
+
+
+def _find_ip_prioritised(
     node_id: NodeId,
     other_node_id: NodeId,
     cycle_digraph: Topology,
@@ -349,21 +395,25 @@ def find_ip_prioritised(
     """
     ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     if not ips:
+        rdma_ip = _ip_from_rdma(other_node_id, cycle_digraph, node_network)
+        if rdma_ip:
+            return rdma_ip
         return None
     other_network = node_network.get(other_node_id, NodeNetworkInfo())
     ip_to_type = {
         iface.ip_address: iface.interface_type for iface in other_network.interfaces
     }
 
-    # Ring should prioritise fastest connection. As a best-effort, we prioritise TB.
-    # TODO: Profile and get actual connection speeds.
+    # Both ring (TCP) and RDMA need routable IPs. Thunderbolt interfaces
+    # often carry link-local 169.254.x.x addresses that TCP sockets cannot
+    # reach on multi-homed hosts, so deprioritise them for ring too.
     if ring:
         priority = {
-            "thunderbolt": 0,
-            "maybe_ethernet": 1,
-            "ethernet": 2,
-            "wifi": 3,
-            "unknown": 4,
+            "ethernet": 0,
+            "wifi": 1,
+            "maybe_ethernet": 2,
+            "unknown": 3,
+            "thunderbolt": 4,
         }
 
     # RDMA prefers ethernet coordinator
@@ -375,7 +425,16 @@ def find_ip_prioritised(
             "maybe_ethernet": 3,
             "thunderbolt": 4,
         }
-    return min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2))
+    best = min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2))
+
+    # Link-local addresses (169.254.x.x) are unreachable over TCP on
+    # multi-homed hosts. Fall through to RDMA-derived LAN IP lookup.
+    if ring and best.startswith("169.254."):
+        rdma_ip = _ip_from_rdma(other_node_id, cycle_digraph, node_network)
+        if rdma_ip:
+            return rdma_ip
+
+    return best
 
 
 def get_mlx_ring_hosts_by_node(
@@ -413,7 +472,7 @@ def get_mlx_ring_hosts_by_node(
                 hosts_for_node.append(Host(ip="198.51.100.1", port=0))
                 continue
 
-            connection_ip = find_ip_prioritised(
+            connection_ip = _find_ip_prioritised(
                 node_id, other_node_id, cycle_digraph, node_network, ring=True
             )
             if connection_ip is None:
@@ -445,7 +504,7 @@ def get_mlx_jaccl_coordinators(
         if n == coordinator:
             return "0.0.0.0"
 
-        ip = find_ip_prioritised(
+        ip = _find_ip_prioritised(
             n, coordinator, cycle_digraph, node_network, ring=False
         )
         if ip is not None:
