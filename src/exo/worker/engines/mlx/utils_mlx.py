@@ -176,7 +176,35 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        jang_config_path = model_path / "jang_config.json"
+        if jang_config_path.exists():
+            # JANG v2: stub mx.eval to lazy-load, EXO will evaluate sharded subset
+            from jang_tools.loader import load_jang_model
+            _orig_eval = mx.eval
+            mx.eval = lambda *args, **kwargs: None
+            try:
+                model, _ = load_jang_model(model_path)
+            finally:
+                mx.eval = _orig_eval
+            # Unwrap LanguageModelOutput returned by mlx_vlm Gemma 4 __call__.
+            # See shard_and_load for full rationale. Apply to single-device path too.
+            try:
+                cls = type(model)
+                orig_call = cls.__call__
+
+                def _unwrap_language_model_output(self, *args, **kwargs):
+                    result = orig_call(self, *args, **kwargs)
+                    if hasattr(result, "logits") and not hasattr(result, "shape"):
+                        return result.logits
+                    return result
+
+                cls.__call__ = _unwrap_language_model_output  # type: ignore[assignment]
+                logger.info(f"JANG: wrapped {cls.__name__}.__call__ to unwrap LanguageModelOutput (single-device)")
+            except Exception as e:
+                logger.warning(f"JANG LanguageModelOutput unwrap patch failed: {e}")
+            logger.info("JANG v2: loaded lazily (single-device, mx.eval stubbed)")
+        else:
+            model, _ = load_model(model_path, lazy=True, strict=False)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,7 +263,101 @@ def shard_and_load(
 ) -> tuple[nn.Module, TokenizerWrapper]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    jang_config_path = model_path / "jang_config.json"
+    if jang_config_path.exists():
+        # JANG v2: call load_jang_model() but stub mx.eval to prevent
+        # materializing the full model. EXO's tensor sharding will eval
+        # only the weights each rank needs.
+        from jang_tools.loader import load_jang_model, _fix_quantized_bits
+        _orig_eval = mx.eval
+        mx.eval = lambda *args, **kwargs: None
+        try:
+            model, _ = load_jang_model(model_path)
+        finally:
+            mx.eval = _orig_eval
+        # Re-run _fix_quantized_bits after lazy load
+        _fix_quantized_bits(model, {})
+        # Thorough fix — walks ALL modules (not just known quant types) checking for
+        # bits/scales attributes. Handles JANG_2S's non-standard group sizes AND
+        # custom quantized classes (like MLA attention layers).
+        try:
+            mismatches_fixed = 0
+            scanned = 0
+            for name, module in model.named_modules():
+                if not (hasattr(module, 'bits') and hasattr(module, 'group_size')
+                        and hasattr(module, 'weight') and hasattr(module, 'scales')):
+                    continue
+                scanned += 1
+                w_cols = module.weight.shape[-1]
+                s_cols = module.scales.shape[-1]
+                cur_in_dim = s_cols * module.group_size
+                cur_matches = (cur_in_dim > 0 and (w_cols * 32) % cur_in_dim == 0
+                               and (w_cols * 32) // cur_in_dim == module.bits)
+                if cur_matches:
+                    continue
+                fixed = False
+                # Try switch/expert layers at 2-bit first (they have 3D weight tensors),
+                # everything else (especially MLA attention) tries higher bits first
+                # because MLA projections are usually 4 or 6-bit, not 2-bit
+                is_switch = (len(module.weight.shape) == 3 and
+                             ("switch_mlp" in name or "experts" in name) and
+                             "shared_experts" not in name)
+                bit_order = (2, 3, 4, 5, 6, 8) if is_switch else (8, 6, 5, 4, 3, 2)
+                for try_bits in bit_order:
+                    needed_in_dim = (w_cols * 32) // try_bits
+                    if (w_cols * 32) % try_bits != 0:
+                        continue
+                    if needed_in_dim % s_cols != 0:
+                        continue
+                    try_gs = needed_in_dim // s_cols
+                    if try_gs in (32, 64, 96, 128, 192, 256, 384, 512):
+                        module.bits = try_bits
+                        module.group_size = try_gs
+                        mismatches_fixed += 1
+                        if mismatches_fixed <= 10:
+                            logger.info(f"JANG fix: {name} → bits={try_bits} gs={try_gs} (cls={type(module).__name__})")
+                        fixed = True
+                        break
+                if not fixed:
+                    logger.warning(f"JANG FAIL: {name} w={tuple(module.weight.shape)} s={tuple(module.scales.shape)} cls={type(module).__name__}")
+            logger.info(f"JANG: scanned {scanned} quant modules, fixed {mismatches_fixed}")
+            # GLM-5.1 uses MLA (kv_lora_rank > 0) and MoE - set bf16 explicitly
+            # to ensure gate routing precision (required for expert selection).
+            model_cfg = json.loads((model_path / "config.json").read_text())
+            text_cfg = model_cfg.get("text_config", model_cfg)
+            if text_cfg.get("kv_lora_rank", 0) > 0:
+                model.set_dtype(mx.bfloat16)
+                logger.info("JANG: explicit bfloat16 for MLA+MoE gate routing precision")
+        except Exception as e:
+            import traceback
+            logger.warning(f"JANG thorough fix failed: {e}\n{traceback.format_exc()}")
+
+        # mlx_vlm models (like Gemma 4) wrap their output in `LanguageModelOutput`
+        # dataclass. EXO's inference pipeline (mlx_lm conventions) expects a bare
+        # `mx.array`, and downstream code either tries to subscript the wrapper
+        # (`'LanguageModelOutput' object is not subscriptable`) or passes it to
+        # `mx.depends` which throws `std::bad_cast`. Patch the top-level class
+        # `__call__` to unwrap `.logits` when present. patch_pipeline_model /
+        # patch_tensor_model in auto_parallel.py wrap AROUND this patch later,
+        # so they'll receive a clean `mx.array`.
+        try:
+            cls = type(model)
+            orig_call = cls.__call__
+
+            def _unwrap_language_model_output(self, *args, **kwargs):
+                result = orig_call(self, *args, **kwargs)
+                if hasattr(result, "logits") and not hasattr(result, "shape"):
+                    return result.logits
+                return result
+
+            cls.__call__ = _unwrap_language_model_output  # type: ignore[assignment]
+            logger.info(f"JANG: wrapped {cls.__name__}.__call__ to unwrap LanguageModelOutput")
+        except Exception as e:
+            logger.warning(f"JANG LanguageModelOutput unwrap patch failed: {e}")
+
+        logger.info("JANG v2: loaded lazily (mx.eval stubbed)")
+    else:
+        model, _ = load_model(model_path, lazy=True, strict=False)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

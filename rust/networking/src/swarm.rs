@@ -138,7 +138,10 @@ fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
             peer_id,
             ..
         })) => Some(FromSwarm::Expired { peer_id }),
-        _ => None,
+        other => {
+            eprintln!("[EXO-NET] Unhandled swarm event: {other:?}");
+            None
+        }
     }
 }
 
