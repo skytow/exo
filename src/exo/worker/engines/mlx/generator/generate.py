@@ -2,15 +2,15 @@ import contextlib
 import functools
 import math
 import time
-from copy import deepcopy
+import uuid
 from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import (
+    generation_stream,
     maybe_quantize_kv_cache,
     stream_generate,
 )
-from mlx_lm.models.cache import ArraysCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -24,7 +24,6 @@ from exo.api.types import (
 )
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
-from exo.shared.types.mlx import KVCacheType, Model
 from exo.shared.types.text_generation import (
     InputMessage,
     InputMessageContent,
@@ -33,19 +32,13 @@ from exo.shared.types.text_generation import (
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
 )
-from exo.worker.engines.mlx.auto_parallel import (
-    PipelineFirstLayer,
-    PipelineLastLayer,
-    clear_prefill_sends,
-    flush_prefill_sends,
-    set_pipeline_prefill,
-    set_pipeline_queue_sends,
-)
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
     KVPrefixCache,
+    copy_snapshot_entry,
     encode_prompt,
     has_non_kv_caches,
+    is_non_trimmable_cache_entry,
     make_kv_cache,
     snapshot_ssm_states,
 )
@@ -55,6 +48,17 @@ from exo.worker.engines.mlx.constants import (
     KV_GROUP_SIZE,
     MAX_TOKENS,
 )
+from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.models.registry import keeps_think_tags, model_type_of
+from exo.worker.engines.mlx.sharding.pipeline import (
+    PipelineFirstLayer,
+    PipelineLastLayer,
+    clear_prefill_sends,
+    flush_prefill_sends,
+    set_pipeline_prefill,
+    set_pipeline_queue_sends,
+)
+from exo.worker.engines.mlx.types import KVCacheType, Model, SnapshotCache
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     fix_unmatched_think_end_tokens,
@@ -69,8 +73,9 @@ from exo.worker.engines.mlx.vision import (
     prepare_vision,
 )
 from exo.worker.runner.bootstrap import logger
+from exo.worker.runner.context_length import check_context_length
 
-generation_stream = mx.new_stream(mx.default_device())
+REMOTE_PREFILL_MIN_TOKENS = 1000
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
@@ -322,6 +327,9 @@ def prefill(
 
     set_pipeline_prefill(model, is_prefill=True)
 
+    # The batch's next decode step may still be running: let it finish before this prefill's
+    # collectives, as for the batch's own prompts (see opt_batch_gen._prompt_after_decode_step)
+    mx.synchronize(generation_stream)
     mx_barrier(group)
     logger.info("Starting prefill")
 
@@ -370,14 +378,16 @@ def prefill(
 
     # stream_generate added 1 extra generated token to the cache, so we should trim it.
     # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
-    pre_gen = deepcopy(snapshots[-2]) if has_ssm else None
+    pre_gen = snapshots[-2] if has_ssm else None
     for i, c in enumerate(cache):
-        if has_ssm and isinstance(c, (ArraysCache, RotatingKVCache)):
+        non_trimmable = is_non_trimmable_cache_entry(c)
+        if has_ssm and non_trimmable:
             assert pre_gen is not None
-            if pre_gen.states[i] is not None:
-                cache[i] = deepcopy(pre_gen.states[i])  # type: ignore
+            restored = copy_snapshot_entry(pre_gen.states[i])
+            if restored is not None:
+                cache[i] = restored  # type: ignore
         else:
-            assert not isinstance(c, (ArraysCache, RotatingKVCache))
+            assert not non_trimmable and not isinstance(c, SnapshotCache)
             c.trim(2)
 
     elapsed = time.perf_counter() - start_time
@@ -412,6 +422,7 @@ def warmup_inference(
     warmup_prompt = apply_chat_template(
         tokenizer=tokenizer,
         task_params=warmup_task_params,
+        model_type=model_type_of(model),
     )
 
     tokens_generated = 0
@@ -440,14 +451,12 @@ def warmup_inference(
 
     logger.info(f"warmed up by generating {tokens_generated} tokens")
     if group is not None:
-        check_for_cancel_every = int(
-            mx.max(
-                mx.distributed.all_gather(
-                    mx.array([check_for_cancel_every]),
-                    group=group,
-                )
-            ).item()
+        gathered = mx.distributed.all_gather(
+            mx.array([check_for_cancel_every]), group=group
         )
+        # On the CPU before the GPU max (see PipelineLastLayer)
+        mx.eval(gathered)
+        check_for_cancel_every = int(mx.max(gathered).item())
 
     logger.info(
         f"runner checking for cancellation every {check_for_cancel_every} tokens"
@@ -534,6 +543,7 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
+    context_length: int = 0,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -543,7 +553,8 @@ def mlx_generate(
 
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
-    all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
+    if not keeps_think_tags(task, model_type_of(model)):
+        all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
     min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
 
     vision: VisionResult | None = None
@@ -565,21 +576,26 @@ def mlx_generate(
     if vision is not None:
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
+    # Before any work on a request the model can't take (and any collective)
+    check_context_length(len(all_prompt_tokens), task.max_output_tokens, context_length)
 
     # Do not use the prefix cache if we are trying to do benchmarks.
     is_bench = task.bench
-    if is_bench:
+    if is_bench and not task.use_prefix_cache:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
     prefix_hit_length = 0
     matched_index: int | None = None
+    is_exact_hit = False
     if kv_prefix_cache is None:
         caches = make_kv_cache(model=model)
         prompt_tokens = all_prompt_tokens
     else:
-        caches, prompt_tokens, matched_index = kv_prefix_cache.get_kv_cache(
-            model, all_prompt_tokens, media_regions=media_regions
+        caches, prompt_tokens, matched_index, is_exact_hit = (
+            kv_prefix_cache.get_kv_cache(
+                model, all_prompt_tokens, media_regions=media_regions
+            )
         )
         prefix_hit_length = len(all_prompt_tokens) - len(prompt_tokens)
         if prefix_hit_length > 0:
@@ -590,7 +606,11 @@ def mlx_generate(
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
         make_logits_processors(
             repetition_penalty=task.repetition_penalty,
-            repetition_context_size=task.repetition_context_size,
+            repetition_context_size=task.repetition_context_size
+            if task.repetition_context_size is not None
+            else 20,
+            presence_penalty=task.presence_penalty,
+            frequency_penalty=task.frequency_penalty,
         )
     )
     if is_bench:
@@ -624,18 +644,74 @@ def mlx_generate(
         if vision is not None
         else contextlib.nullcontext()
     )
+    use_remote = (
+        len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
+        and task.prefill_endpoint is not None
+    )
+    remote_prefilled = False
+    prefill_tps = 0.0
+    prefill_tokens = 0
+    ssm_snapshots_list: list[CacheSnapshot] = []
     with maybe_vision_ctx:
-        prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
-            model,
-            tokenizer,
-            sampler,
-            prompt_tokens[:-1],
-            caches,
-            group,
-            on_prefill_progress,
-            distributed_prompt_progress_callback,
-        )
+        if use_remote and task.prefill_endpoint is not None:
+            try:
+                prefill_tps, prefill_tokens, ssm_snapshots_list = remote_prefill(
+                    prompt_tokens[:-1],
+                    caches,
+                    on_prefill_progress,
+                    endpoint=task.prefill_endpoint,
+                    request_id=str(uuid.uuid4()),
+                    model_id=str(task.model),
+                    start_pos=prefix_hit_length,
+                )
+                remote_prefilled = True
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Remote prefill failed, falling back to local prefill"
+                )
+        if not remote_prefilled:
+            prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
+                model,
+                tokenizer,
+                sampler,
+                prompt_tokens[:-1],
+                caches,
+                group,
+                on_prefill_progress,
+                distributed_prompt_progress_callback,
+            )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
+
+    if kv_prefix_cache is not None and matched_index is not None and is_exact_hit:
+        prefill_tps = kv_prefix_cache.prefill_tps[matched_index]
+
+    if kv_prefix_cache is not None:
+        hit_ratio = (
+            prefix_hit_length / len(all_prompt_tokens)
+            if len(all_prompt_tokens) > 0
+            else 0.0
+        )
+        if matched_index is not None and (
+            prefix_hit_length >= min_prefix_hit_length
+            and hit_ratio >= _MIN_PREFIX_HIT_RATIO_TO_UPDATE
+        ):
+            kv_prefix_cache.update_kv_cache(
+                matched_index,
+                all_prompt_tokens,
+                caches,
+                cache_snapshots,
+                restore_pos=prefix_hit_length,
+                media_regions=media_regions,
+                prefill_tps=prefill_tps,
+            )
+        else:
+            kv_prefix_cache.add_kv_cache(
+                all_prompt_tokens,
+                caches,
+                cache_snapshots,
+                media_regions=media_regions,
+                prefill_tps=prefill_tps,
+            )
 
     # stream_generate starts from the last token
     last_token = prompt_tokens[-2:]
@@ -736,40 +812,6 @@ def mlx_generate(
                 f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
                 f"{generation_tps:.1f} tok/s"
             )
-            if kv_prefix_cache is not None:
-                generated_tokens_array = mx.array(
-                    tokenizer.encode(
-                        "".join(generated_text_parts), add_special_tokens=False
-                    )
-                )
-                full_prompt_tokens = mx.concatenate(
-                    [all_prompt_tokens, generated_tokens_array]
-                )
-                hit_ratio = (
-                    prefix_hit_length / len(all_prompt_tokens)
-                    if len(all_prompt_tokens) > 0
-                    else 0.0
-                )
-                if matched_index is not None and (
-                    prefix_hit_length >= min_prefix_hit_length
-                    and hit_ratio >= _MIN_PREFIX_HIT_RATIO_TO_UPDATE
-                ):
-                    kv_prefix_cache.update_kv_cache(
-                        matched_index,
-                        full_prompt_tokens,
-                        caches,
-                        cache_snapshots,
-                        restore_pos=prefix_hit_length,
-                        media_regions=media_regions,
-                    )
-                else:
-                    kv_prefix_cache.add_kv_cache(
-                        full_prompt_tokens,
-                        caches,
-                        cache_snapshots,
-                        media_regions=media_regions,
-                    )
-
         if on_generation_token is not None:
             on_generation_token()
 

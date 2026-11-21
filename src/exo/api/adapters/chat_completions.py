@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from exo.api.collected_response import GenerationFailedError, request_error
 from exo.api.types import (
     ChatCompletionChoice,
     ChatCompletionMessage,
@@ -23,6 +24,7 @@ from exo.api.types import (
     Usage,
 )
 from exo.download.download_utils import create_http_session
+from exo.shared.request_errors import generation_error_code
 from exo.shared.types.chunks import (
     ErrorChunk,
     PrefillProgressChunk,
@@ -131,9 +133,13 @@ async def chat_request_to_text_generation(
                         multimodal_content.append({"type": "text", "text": part.text})
                     else:
                         multimodal_content.append({"type": "image"})
-                chat_template_messages.append(
-                    {"role": msg.role, "content": multimodal_content}
-                )
+                multimodal_msg: dict[str, Any] = {
+                    "role": msg.role,
+                    "content": multimodal_content,
+                }
+                if msg.reasoning_content is not None:
+                    multimodal_msg["reasoning_content"] = msg.reasoning_content
+                chat_template_messages.append(multimodal_msg)
                 continue
             msg_copy = msg.model_copy(update={"content": content})
 
@@ -168,6 +174,8 @@ async def chat_request_to_text_generation(
         min_p=request.min_p,
         repetition_penalty=request.repetition_penalty,
         repetition_context_size=request.repetition_context_size,
+        presence_penalty=request.presence_penalty,
+        frequency_penalty=request.frequency_penalty,
         images=images,
     )
 
@@ -225,14 +233,16 @@ async def generate_chat_stream(
                 yield f": prefill_progress {chunk.model_dump_json()}\n\n"
 
             case ErrorChunk():
+                message = chunk.error_message or "Internal server error"
                 error_response = ErrorResponse(
-                    error=ErrorInfo(
-                        message=chunk.error_message or "Internal server error",
+                    error=request_error(message)
+                    or ErrorInfo(
+                        message=message,
                         type="InternalServerError",
-                        code=500,
+                        code=generation_error_code(chunk.error_message) or 500,
                     )
                 )
-                yield f"data: {error_response.model_dump_json()}\n\n"
+                yield f"data: {error_response.model_dump_json(exclude_none=True)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
@@ -263,7 +273,7 @@ async def generate_chat_stream(
                     ],
                     usage=last_usage,
                 )
-                yield f"data: {tool_response.model_dump_json()}\n\n"
+                yield f"data: {tool_response.model_dump_json(exclude_none=True)}\n\n"
                 if chunk.stats is not None:
                     yield f": generation_stats {chunk.stats.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
@@ -277,7 +287,7 @@ async def generate_chat_stream(
                     chunk_response = chunk_response.model_copy(
                         update={"usage": last_usage}
                     )
-                yield f"data: {chunk_response.model_dump_json()}\n\n"
+                yield f"data: {chunk_response.model_dump_json(exclude_none=True)}\n\n"
 
                 if chunk.finish_reason is not None:
                     if chunk.stats is not None:
@@ -301,7 +311,7 @@ async def collect_chat_response(
     logprobs_content: list[LogprobsContentItem] = []
     model: str | None = None
     finish_reason: FinishReason | None = None
-    error_message: str | None = None
+    error: ErrorChunk | None = None
     last_usage: Usage | None = None
 
     async for chunk in chunk_stream:
@@ -310,7 +320,7 @@ async def collect_chat_response(
                 continue
 
             case ErrorChunk():
-                error_message = chunk.error_message or "Internal server error"
+                error = chunk
                 break
 
             case TokenChunk():
@@ -346,8 +356,8 @@ async def collect_chat_response(
                 )
                 finish_reason = chunk.finish_reason
 
-    if error_message is not None:
-        raise ValueError(error_message)
+    if error is not None:
+        raise GenerationFailedError(error.error_message or "Internal server error")
 
     combined_text = "".join(text_parts)
     combined_thinking = "".join(thinking_parts) if thinking_parts else None
@@ -373,5 +383,5 @@ async def collect_chat_response(
             )
         ],
         usage=last_usage,
-    ).model_dump_json()
+    ).model_dump_json(exclude_none=True)
     return

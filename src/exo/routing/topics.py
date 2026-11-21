@@ -1,14 +1,15 @@
 from dataclasses import dataclass
 from enum import Enum
 
-from exo.routing.connection_message import ConnectionMessage
+from exo.routing.membership import Member
 from exo.shared.election import ElectionMessage
 from exo.shared.types.commands import ForwarderCommand, ForwarderDownloadCommand
 from exo.shared.types.events import (
     GlobalForwarderEvent,
     LocalForwarderEvent,
+    StateSnapshot,
 )
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.utils.pydantic_ext import FrozenModel
 
 
 class PublishPolicy(str, Enum):
@@ -21,13 +22,16 @@ class PublishPolicy(str, Enum):
 
 
 @dataclass  # (frozen=True)
-class TypedTopic[T: CamelCaseModel]:
+class TypedTopic[T: FrozenModel]:
     topic: str
     publish_policy: PublishPolicy
 
     model_type: type[
         T
     ]  # This can be worked around with evil type hacking, see https://stackoverflow.com/a/71720366 - I don't think it's necessary here.
+
+    # Send ahead of normal traffic, e.g. so election messages don't queue behind events
+    high_priority: bool = False
 
     @staticmethod
     def serialize(t: T) -> bytes:
@@ -39,13 +43,13 @@ class TypedTopic[T: CamelCaseModel]:
 
 GLOBAL_EVENTS = TypedTopic("global_events", PublishPolicy.Always, GlobalForwarderEvent)
 LOCAL_EVENTS = TypedTopic("local_events", PublishPolicy.Always, LocalForwarderEvent)
+STATE_SNAPSHOTS = TypedTopic("state_snapshots", PublishPolicy.Always, StateSnapshot)
 COMMANDS = TypedTopic("commands", PublishPolicy.Always, ForwarderCommand)
 ELECTION_MESSAGES = TypedTopic(
-    "election_messages", PublishPolicy.Always, ElectionMessage
+    "election_messages", PublishPolicy.Always, ElectionMessage, high_priority=True
 )
-CONNECTION_MESSAGES = TypedTopic(
-    "connection_messages", PublishPolicy.Never, ConnectionMessage
-)
+# Each change of a node's state, as this node's networking sees it (see exo.routing.membership)
+MEMBERSHIP = TypedTopic("membership", PublishPolicy.Never, Member)
 DOWNLOAD_COMMANDS = TypedTopic(
     "download_commands", PublishPolicy.Always, ForwarderDownloadCommand
 )

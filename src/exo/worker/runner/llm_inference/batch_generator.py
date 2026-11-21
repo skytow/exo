@@ -1,29 +1,45 @@
 import itertools
 import time
-from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
+from typing import BinaryIO
 
 import mlx.core as mx
+from jinja2 import TemplateError
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
-from exo.shared.types.chunks import ErrorChunk, PrefillProgressChunk
+from exo.shared.request_errors import user_facing_detail
+from exo.shared.types.chunks import ErrorChunk, GenerationChunk, PrefillProgressChunk
 from exo.shared.types.common import ModelId
-from exo.shared.types.events import ChunkGenerated, Event
-from exo.shared.types.mlx import Model
-from exo.shared.types.tasks import CANCEL_ALL_TASKS, TaskId, TextGeneration
+from exo.shared.types.events import ChunkGenerated, RunnerEvent
+from exo.shared.types.tasks import (
+    CANCEL_ALL_TASKS,
+    GenerationTask,
+    TaskId,
+    TextGeneration,
+)
 from exo.shared.types.text_generation import TextGenerationTaskParams
-from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
+from exo.shared.types.worker.runner_response import (
+    CancelledResponse,
+    FinishedResponse,
+    GenerationResponse,
+)
 from exo.utils.channels import MpReceiver, MpSender
+from exo.worker.disaggregated.server import PrefillRequest
+from exo.worker.engines.base import Engine
 from exo.worker.engines.mlx.cache import KVPrefixCache
+from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
+from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
     warmup_inference,
 )
+from exo.worker.engines.mlx.models.registry import model_type_of
+from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     mx_all_gather_tasks,
@@ -31,17 +47,14 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.engines.mlx.vision import VisionProcessor
 from exo.worker.runner.bootstrap import logger
+from exo.worker.runner.context_length import (
+    InvalidRequestError,
+    RequestRefusedError,
+)
+from exo.worker.runner.failures import describe_failure
 
-from .model_output_parsers import apply_all_parsers
+from .model_output_parsers import apply_all_parsers, map_responses_to_chunks
 from .tool_parsers import ToolParser
-
-
-class Cancelled:
-    pass
-
-
-class Finished:
-    pass
 
 
 class GeneratorQueue[T]:
@@ -57,35 +70,6 @@ class GeneratorQueue[T]:
                 yield None
             else:
                 yield self._q.popleft()
-
-
-class InferenceGenerator(ABC):
-    _cancelled_tasks: set[TaskId]
-
-    def should_cancel(self, task_id: TaskId) -> bool:
-        return (
-            task_id in self._cancelled_tasks
-            or CANCEL_ALL_TASKS in self._cancelled_tasks
-        )
-
-    @abstractmethod
-    def warmup(self) -> None: ...
-
-    @abstractmethod
-    def submit(
-        self,
-        task: TextGeneration,
-    ) -> None: ...
-
-    @abstractmethod
-    def step(
-        self,
-    ) -> Iterable[
-        tuple[TaskId, ToolCallResponse | GenerationResponse | Cancelled | Finished]
-    ]: ...
-
-    @abstractmethod
-    def close(self) -> None: ...
 
 
 EXO_RUNNER_MUST_FAIL = "EXO RUNNER MUST FAIL"
@@ -110,8 +94,21 @@ def _check_for_debug_prompts(task_params: TextGenerationTaskParams) -> None:
         time.sleep(100)
 
 
+def _render_prompt(
+    tokenizer: TokenizerWrapper, params: TextGenerationTaskParams, model: Model
+) -> str:
+    """The request's prompt, from the model's chat template. A template that can't render the
+    request (roles out of order, say) refuses it: the request is at fault, not the model."""
+    try:
+        return apply_chat_template(tokenizer, params, model_type_of(model))
+    except TemplateError as error:
+        raise InvalidRequestError(
+            f"the model's chat template failed: {user_facing_detail(str(error))}"
+        ) from error
+
+
 @dataclass(eq=False)
-class SequentialGenerator(InferenceGenerator):
+class SequentialGenerator(Engine):
     model: Model
     tokenizer: TokenizerWrapper
     group: mx.distributed.Group | None
@@ -120,9 +117,11 @@ class SequentialGenerator(InferenceGenerator):
     model_id: ModelId
     device_rank: int
     cancel_receiver: MpReceiver[TaskId]
-    event_sender: MpSender[Event]
+    event_sender: MpSender[RunnerEvent]
     vision_processor: VisionProcessor | None = None
     check_for_cancel_every: int = 50
+    # The longest context the model takes; 0 if unknown (see context_length)
+    context_length: int = 0
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
@@ -137,7 +136,7 @@ class SequentialGenerator(InferenceGenerator):
             # queue that the 1st generator should push to and 3rd generator should pull from
             GeneratorQueue[GenerationResponse],
             # generator to get parsed outputs
-            Generator[GenerationResponse | ToolCallResponse | None],
+            Iterator[GenerationChunk | None],
         ]
         | None
     ) = field(default=None, init=False)
@@ -152,8 +151,9 @@ class SequentialGenerator(InferenceGenerator):
 
     def submit(
         self,
-        task: TextGeneration,
+        task: GenerationTask,
     ) -> None:
+        assert isinstance(task, TextGeneration)
         self._cancelled_tasks.discard(CANCEL_ALL_TASKS)
         self._all_tasks[task.task_id] = task
         self._maybe_queue.append(task)
@@ -161,8 +161,10 @@ class SequentialGenerator(InferenceGenerator):
     def agree_on_tasks(self) -> None:
         """Agree between all ranks about the task ordering (some may have received in different order or not at all)."""
         agreed, different = mx_all_gather_tasks(self._maybe_queue, self.group)
-        self._queue.extend(task for task in self._maybe_queue if task in agreed)
-        self._maybe_queue = [task for task in self._maybe_queue if task in different]
+        # Extend from `agreed` (sorted by task_id on all ranks) to guarantee every
+        # rank enqueues tasks in the same order, preventing TP collective deadlocks.
+        self._queue.extend(agreed)
+        self._maybe_queue = list(different)
 
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
@@ -183,68 +185,112 @@ class SequentialGenerator(InferenceGenerator):
 
     def step(
         self,
-    ) -> Iterable[
-        tuple[TaskId, GenerationResponse | ToolCallResponse | Cancelled | Finished]
+    ) -> Iterator[
+        tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
     ]:
+        output: list[
+            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
+        ] = []
         if self._active is None:
             self.agree_on_tasks()
 
             if self._queue:
-                self._start_next()
-            else:
-                return map(lambda task: (task, Cancelled()), self._cancelled_tasks)
+                output.extend(self._start_next())
+            if self._active is None:
+                return itertools.chain(
+                    output,
+                    map(
+                        lambda task: (task, CancelledResponse()), self._cancelled_tasks
+                    ),
+                )
 
-        assert self._active is not None
-
-        task, mlx_gen, queue, output_generator = self._active
-        output: list[
-            tuple[TaskId, GenerationResponse | ToolCallResponse | Cancelled | Finished]
-        ] = []
+        task, gen, queue, output_generator = self._active
         try:
-            response = next(mlx_gen)
+            response = next(gen)
             queue.push(response)
             # drain potentially many responses every time
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
 
         except (StopIteration, PrefillCancelled):
-            output.append((task.task_id, Finished()))
+            output.append((task.task_id, FinishedResponse()))
             self._active = None
             if self._queue:
-                self._start_next()
+                output.extend(self._start_next())
+
+        except RequestRefusedError as refusal:
+            # Raised as the prompt is tokenized, the same way on every rank
+            output.extend(self._refuse(task, refusal))
+            self._active = None
+            if self._queue:
+                output.extend(self._start_next())
 
         except Exception as e:
             self._send_error(task, e)
             self._active = None
             raise
 
-        return itertools.chain(
-            output,
-            map(lambda task: (task, Cancelled()), self._cancelled_tasks),
+        return filter(
+            lambda chunk: (
+                not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
+            ),
+            itertools.chain(
+                output,
+                map(lambda task: (task, CancelledResponse()), self._cancelled_tasks),
+            ),
         )
 
-    def _start_next(self) -> None:
-        task = self._queue.popleft()
-        try:
-            mlx_gen = self._build_generator(task)
-        except Exception as e:
-            self._send_error(task, e)
-            raise
+    def _start_next(self) -> list[tuple[TaskId, FinishedResponse]]:
+        """Start the next request; what to report for those refused on the way"""
+        refused: list[tuple[TaskId, FinishedResponse]] = []
+        while self._queue:
+            task = self._queue.popleft()
+            try:
+                prompt = _render_prompt(self.tokenizer, task.task_params, self.model)
+                gen = self._build_generator(task, prompt)
+            except RequestRefusedError as refusal:
+                refused.extend(self._refuse(task, refusal))
+                continue
+            except Exception as e:
+                self._send_error(task, e)
+                raise
+            self._activate(task, gen, prompt)
+            break
+        return refused
+
+    def _refuse(
+        self, task: TextGeneration, refusal: RequestRefusedError
+    ) -> list[tuple[TaskId, FinishedResponse]]:
+        logger.info(f"Refusing request {task.command_id}: {refusal}")
+        if self.device_rank == 0:
+            self.event_sender.send(
+                ChunkGenerated(
+                    command_id=task.command_id,
+                    chunk=ErrorChunk(model=self.model_id, error_message=str(refusal)),
+                )
+            )
+        return [(task.task_id, FinishedResponse())]
+
+    def _activate(
+        self, task: TextGeneration, gen: Generator[GenerationResponse], prompt: str
+    ) -> None:
         queue = GeneratorQueue[GenerationResponse]()
 
         if task.task_params.bench:
-            output_generator = queue.gen()
+            output_generator: Iterator[GenerationChunk | None] = map(
+                lambda r: map_responses_to_chunks(r, self.model_id), queue.gen()
+            )
         else:
             output_generator = apply_all_parsers(
                 queue.gen(),
-                apply_chat_template(self.tokenizer, task.task_params),
+                prompt,
                 self.tool_parser,
                 self.tokenizer,
                 type(self.model),
                 self.model_id,
                 task.task_params.tools,
             )
-        self._active = (task, mlx_gen, queue, output_generator)
+        self._active = (task, gen, queue, output_generator)
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:
         if self.device_rank == 0:
@@ -254,14 +300,15 @@ class SequentialGenerator(InferenceGenerator):
                     chunk=ErrorChunk(
                         model=self.model_id,
                         finish_reason="error",
-                        error_message=str(e),
+                        error_message=describe_failure(e),
                     ),
                 )
             )
 
-    def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
+    def _build_generator(
+        self, task: TextGeneration, prompt: str
+    ) -> Generator[GenerationResponse]:
         _check_for_debug_prompts(task.task_params)
-        prompt = apply_chat_template(self.tokenizer, task.task_params)
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:
@@ -307,14 +354,31 @@ class SequentialGenerator(InferenceGenerator):
             on_generation_token=on_generation_token,
             group=self.group,
             vision_processor=self.vision_processor,
+            context_length=self.context_length,
         )
 
     def close(self) -> None:
         del self.model, self.tokenizer, self.group
 
+    def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
+        cache = run_prefill_for_request(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            group=self.group,
+            kv_prefix_cache=self.kv_prefix_cache,
+            request=request,
+        )
+        write_cache_to_wire(
+            wfile,
+            cache,
+            request_id=request.request_id,
+            model_id=request.model_id,
+            start_pos=request.start_pos,
+        )
+
 
 @dataclass(eq=False)
-class BatchGenerator(InferenceGenerator):
+class BatchGenerator(Engine):
     model: Model
     tokenizer: TokenizerWrapper
     group: mx.distributed.Group | None
@@ -323,32 +387,35 @@ class BatchGenerator(InferenceGenerator):
     model_id: ModelId
     device_rank: int
     cancel_receiver: MpReceiver[TaskId]
-    event_sender: MpSender[Event]
+    event_sender: MpSender[RunnerEvent]
     check_for_cancel_every: int = 50
     vision_processor: VisionProcessor | None = None
+    # The longest context the model takes; 0 if unknown (see context_length)
+    context_length: int = 0
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
-    _mlx_gen: ExoBatchGenerator = field(init=False)
+    _gen: ExoBatchGenerator = field(init=False)
     _active_tasks: dict[
         int,
         tuple[
             TextGeneration,
             GeneratorQueue[GenerationResponse],
-            Generator[GenerationResponse | ToolCallResponse | None],
+            Iterator[GenerationChunk | None],
         ],
     ] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
-        self._mlx_gen = ExoBatchGenerator(
+        self._gen = ExoBatchGenerator(
             model=self.model,
             tokenizer=self.tokenizer,
             group=self.group,
             kv_prefix_cache=self.kv_prefix_cache,
             vision_processor=self.vision_processor,
+            context_length=self.context_length,
         )
 
     def warmup(self):
@@ -361,8 +428,9 @@ class BatchGenerator(InferenceGenerator):
 
     def submit(
         self,
-        task: TextGeneration,
+        task: GenerationTask,
     ) -> None:
+        assert isinstance(task, TextGeneration)
         self._cancelled_tasks.discard(CANCEL_ALL_TASKS)
         self._all_tasks[task.task_id] = task
         self._maybe_queue.append(task)
@@ -370,8 +438,10 @@ class BatchGenerator(InferenceGenerator):
     def agree_on_tasks(self) -> None:
         """Agree between all ranks about the task ordering (some may have received in different order or not at all)."""
         agreed, different = mx_all_gather_tasks(self._maybe_queue, self.group)
-        self._queue.extend(task for task in self._maybe_queue if task in agreed)
-        self._maybe_queue = [task for task in self._maybe_queue if task in different]
+        # Extend from `agreed` (sorted by task_id on all ranks) to guarantee every
+        # rank enqueues tasks in the same order, preventing TP collective deadlocks.
+        self._queue.extend(agreed)
+        self._maybe_queue = list(different)
 
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
@@ -392,18 +462,24 @@ class BatchGenerator(InferenceGenerator):
 
     def step(
         self,
-    ) -> Iterable[
-        tuple[TaskId, GenerationResponse | ToolCallResponse | Cancelled | Finished]
+    ) -> Iterator[
+        tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
     ]:
         if not self._queue:
             self.agree_on_tasks()
 
+        refused: list[tuple[TaskId, FinishedResponse]] = []
         # Submit any queued tasks to the engine
         while self._queue and len(self._active_tasks) < EXO_MAX_CONCURRENT_REQUESTS:
             task = self._queue.popleft()
             try:
-                uid = self._start_task(task)
+                prompt = _render_prompt(self.tokenizer, task.task_params, self.model)
+                uid = self._start_task(task, prompt)
             except PrefillCancelled:
+                continue
+            except RequestRefusedError as refusal:
+                # Raised as the prompt is tokenized, the same way on every rank
+                refused.append(self._refuse(task, refusal))
                 continue
             except Exception as e:
                 self._send_error(task, e)
@@ -411,11 +487,13 @@ class BatchGenerator(InferenceGenerator):
 
             queue = GeneratorQueue[GenerationResponse]()
             if task.task_params.bench:
-                output_generator = queue.gen()
+                output_generator: Iterator[GenerationChunk | None] = map(
+                    lambda r: map_responses_to_chunks(r, self.model_id), queue.gen()
+                )
             else:
                 output_generator = apply_all_parsers(
                     queue.gen(),
-                    apply_chat_template(self.tokenizer, task.task_params),
+                    prompt,
                     self.tool_parser,
                     self.tokenizer,
                     type(self.model),
@@ -424,14 +502,14 @@ class BatchGenerator(InferenceGenerator):
                 )
             self._active_tasks[uid] = (task, queue, output_generator)
 
-        if not self._mlx_gen.has_work:
-            return self._apply_cancellations()
+        if not self._gen.has_work:
+            return itertools.chain(refused, self._apply_cancellations())
 
-        results = self._mlx_gen.step()
+        results = self._gen.step()
 
         output: list[
-            tuple[TaskId, GenerationResponse | ToolCallResponse | Cancelled | Finished]
-        ] = []
+            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
+        ] = [*refused]
         for uid, response in results:
             if uid not in self._active_tasks:
                 # should we error here?
@@ -446,38 +524,55 @@ class BatchGenerator(InferenceGenerator):
 
             # check if original response was terminal and append a Finished()
             if response.finish_reason is not None:
-                output.append((task.task_id, Finished()))
+                output.append((task.task_id, FinishedResponse()))
                 del self._active_tasks[uid]
 
-        return itertools.chain(output, self._apply_cancellations())
+        return filter(
+            lambda chunk: (
+                not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
+            ),
+            itertools.chain(output, self._apply_cancellations()),
+        )
 
     def _apply_cancellations(
         self,
-    ) -> list[tuple[TaskId, Cancelled]]:
+    ) -> Iterator[tuple[TaskId, CancelledResponse]]:
         if not self._cancelled_tasks:
-            return []
+            return iter([])
 
         cancel_all = CANCEL_ALL_TASKS in self._cancelled_tasks
 
         uids_to_cancel: list[int] = []
-        results: list[tuple[TaskId, Cancelled]] = []
+        results: list[tuple[TaskId, CancelledResponse]] = []
 
         for uid, (task, _, _) in list(self._active_tasks.items()):
             if task.task_id in self._cancelled_tasks or cancel_all:
                 uids_to_cancel.append(uid)
-                results.append((task.task_id, Cancelled()))
+                results.append((task.task_id, CancelledResponse()))
                 del self._active_tasks[uid]
 
         if uids_to_cancel:
-            self._mlx_gen.cancel(uids_to_cancel)
+            self._gen.cancel(uids_to_cancel)
 
         already_cancelled = {tid for tid, _ in results}
         for tid in self._cancelled_tasks:
             if tid != CANCEL_ALL_TASKS and tid not in already_cancelled:
-                results.append((tid, Cancelled()))
+                results.append((tid, CancelledResponse()))
 
+        # A cancelled task that hasn't started must never start: the runner has already
+        # forgotten it. The cancellation is agreed, so every rank drops the same tasks.
+        self._queue = deque(
+            task
+            for task in self._queue
+            if not cancel_all and task.task_id not in self._cancelled_tasks
+        )
+        self._maybe_queue = [
+            task
+            for task in self._maybe_queue
+            if not cancel_all and task.task_id not in self._cancelled_tasks
+        ]
         self._cancelled_tasks.clear()
-        return results
+        return iter(results)
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:
         if self.device_rank == 0:
@@ -487,14 +582,26 @@ class BatchGenerator(InferenceGenerator):
                     chunk=ErrorChunk(
                         model=self.model_id,
                         finish_reason="error",
-                        error_message=str(e),
+                        error_message=describe_failure(e),
                     ),
                 )
             )
 
-    def _start_task(self, task: TextGeneration) -> int:
+    def _refuse(
+        self, task: TextGeneration, refusal: RequestRefusedError
+    ) -> tuple[TaskId, FinishedResponse]:
+        logger.info(f"Refusing request {task.command_id}: {refusal}")
+        if self.device_rank == 0:
+            self.event_sender.send(
+                ChunkGenerated(
+                    command_id=task.command_id,
+                    chunk=ErrorChunk(model=self.model_id, error_message=str(refusal)),
+                )
+            )
+        return task.task_id, FinishedResponse()
+
+    def _start_task(self, task: TextGeneration, prompt: str) -> int:
         _check_for_debug_prompts(task.task_params)
-        prompt = apply_chat_template(self.tokenizer, task.task_params)
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:
@@ -529,7 +636,7 @@ class BatchGenerator(InferenceGenerator):
 
                 self.agree_on_tasks()
 
-        return self._mlx_gen.submit(
+        return self._gen.submit(
             task_params=task.task_params,
             prompt=prompt,
             on_prefill_progress=on_prefill_progress,
@@ -538,5 +645,21 @@ class BatchGenerator(InferenceGenerator):
         )
 
     def close(self) -> None:
-        self._mlx_gen.close()
+        self._gen.close()
         del self.model, self.tokenizer, self.group
+
+    def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
+        cache = run_prefill_for_request(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            group=self.group,
+            kv_prefix_cache=self.kv_prefix_cache,
+            request=request,
+        )
+        write_cache_to_wire(
+            wfile,
+            cache,
+            request_id=request.request_id,
+            model_id=request.model_id,
+            start_pos=request.start_pos,
+        )

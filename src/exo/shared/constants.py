@@ -61,18 +61,31 @@ RESOURCES_DIR = (
     find_resources() if _RESOURCES_DIR_ENV is None else Path.home() / _RESOURCES_DIR_ENV
 )
 _DASHBOARD_DIR_ENV = os.environ.get("EXO_DASHBOARD_DIR", None)
-DASHBOARD_DIR = (
-    find_dashboard() if _DASHBOARD_DIR_ENV is None else Path.home() / _DASHBOARD_DIR_ENV
-)
+
+
+def dashboard_dir() -> Path:
+    """The built dashboard. Looked up only when it's served, so exo --help and --version work
+    before the dashboard is built."""
+    if _DASHBOARD_DIR_ENV is not None:
+        return Path.home() / _DASHBOARD_DIR_ENV
+    return find_dashboard()
+
 
 # Log files (data/logs or cache)
 EXO_LOG_DIR = EXO_CACHE_HOME / "exo_log"
 EXO_LOG = EXO_LOG_DIR / "exo.log"
+EXO_RUNNER_LOG_DIR = EXO_LOG_DIR / "runner_log"
+EXO_RUNNER_STDOUT_LOG = EXO_RUNNER_LOG_DIR / "stdout.log"
+EXO_RUNNER_STDERR_LOG = EXO_RUNNER_LOG_DIR / "stderr.log"
+
 EXO_TEST_LOG = EXO_CACHE_HOME / "exo_test.log"
+EXO_PID_FILE = EXO_CACHE_HOME / "exo.pid"
 
 # Identity (config)
-EXO_NODE_ID_KEYPAIR = EXO_CONFIG_HOME / "node_id.keypair"
+EXO_NODE_ZID = EXO_CACHE_HOME / "node_zid"
 EXO_CONFIG_FILE = EXO_CONFIG_HOME / "config.toml"
+# The models users launched and stopped, as this node knows them (exo.shared.deployment_store)
+EXO_DEPLOYMENTS_FILE = EXO_DATA_HOME / "deployments.json"
 
 # libp2p topics for event forwarding
 LIBP2P_LOCAL_EVENTS_TOPIC = "worker_events"
@@ -95,6 +108,8 @@ EXO_ENABLE_IMAGE_MODELS = (
 EXO_OFFLINE = os.getenv("EXO_OFFLINE", "false").lower() == "true"
 
 EXO_TRACING_ENABLED = os.getenv("EXO_TRACING_ENABLED", "false").lower() == "true"
+
+ENABLE_DISAGGREGATION = os.getenv("ENABLE_DISAGGREGATION", "false").lower() == "true"
 
 EXO_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXO_MAX_CONCURRENT_REQUESTS", "8"))
 

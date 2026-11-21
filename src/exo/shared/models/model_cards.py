@@ -1,6 +1,6 @@
 import json
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import aiofiles
 import aiofiles.os as aios
@@ -26,9 +26,12 @@ from exo.shared.constants import (
     EXO_MODELS_DIRS,
     RESOURCES_DIR,
 )
+from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.shared.types.text_generation import ReasoningDialect
+from exo.utils.pydantic_ext import FrozenModel
+from exo.worker.engines.mlx.models.spec_registry import tensor_parallel_architectures
 
 # kinda ugly...
 # TODO: load search path from config.toml
@@ -38,10 +41,80 @@ _BUILTIN_CARD_DIRS = [
     Path(RESOURCES_DIR) / "image_model_cards",
 ]
 
-_card_cache: dict[ModelId, "ModelCard"] = {}
+
+class _CardCache:
+    def __init__(self):
+        self.cc: dict[ModelId, "ModelCard"] = {}
+
+    def get(self, model_id: ModelId) -> "ModelCard | None":
+        return self.cc.get(model_id)
+
+    async def save(self, card: "ModelCard"):
+        self.cc[card.model_id] = card
+        try:
+            await card.save_to_custom_dir()
+        except OSError as e:
+            logger.warning(f"failed to save custom model card ({e.strerror})")
+
+    async def pop(self, model_id: ModelId) -> "ModelCard | None":
+        """Delete a user-added custom model card. Returns True if deleted."""
+        card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
+        try:
+            if await card_path.exists():
+                await card_path.unlink()
+                return self.cc.pop(model_id, None)
+        except OSError as e:
+            logger.warning(f"failed to delete custom model card ({e.strerror})")
+
+    async def list_all(self) -> list["ModelCard"]:
+        if len(self.cc) == 0:
+            await self.refresh()
+        if EXO_ENABLE_IMAGE_MODELS:
+            return list(self.cc.values())
+        return [c for c in self.cc.values() if not _is_image_card(c)]
+
+    async def list_custom(self) -> list["ModelCard"]:
+        """The user-added cards saved on this node."""
+        await self.refresh()
+        return [c for c in self.cc.values() if c.is_custom]
+
+    async def _load_cards_from_dir(
+        self,
+        directory: Path,
+        into: dict[ModelId, "ModelCard"],
+        *,
+        is_custom: bool,
+    ) -> None:
+        """Read all TOML model cards in a directory into `into`, skipping cards already
+        read or already in the cache."""
+        async for toml_file in directory.rglob("*.toml"):
+            try:
+                card = await ModelCard.load_from_path(toml_file)
+                if is_custom:
+                    card = card.model_copy(update={"is_custom": True})
+                if card.model_id not in into and self.get(card.model_id) is None:
+                    into[card.model_id] = card
+            except (ValidationError, TOMLKitError) as e:
+                logger.opt(exception=e).warning(
+                    f"failed to validate model card at {toml_file}"
+                )
+
+    async def refresh(self) -> None:
+        # Read every card before adding any. Each file read yields to the event loop, and
+        # list_all, called meanwhile (e.g. by the API while the downloader's first call is
+        # still reading), would otherwise return the cards read so far as the catalog.
+        loaded: dict[ModelId, ModelCard] = {}
+        for path in _BUILTIN_CARD_DIRS:
+            await self._load_cards_from_dir(path, loaded, is_custom=False)
+        await self._load_cards_from_dir(_custom_cards_dir, loaded, is_custom=True)
+        for model_id, card in loaded.items():
+            self.cc.setdefault(model_id, card)
 
 
-def _detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
+card_cache = _CardCache()
+
+
+def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
     normalized = model_id.normalize()
     for model_dir in [d / normalized for d in EXO_MODELS_DIRS]:
         config_path = model_dir / "config.json"
@@ -58,44 +131,8 @@ def _detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
     return None
 
 
-async def _load_cards_from_dir(directory: Path, *, is_custom: bool) -> None:
-    """Load all TOML model cards from a directory into the cache."""
-    async for toml_file in directory.rglob("*.toml"):
-        try:
-            card = await ModelCard.load_from_path(toml_file)
-            if is_custom:
-                card = card.model_copy(update={"is_custom": True})
-            if card.vision is None:
-                vision = _detect_vision_from_config(card.model_id)
-                if vision is not None:
-                    card = card.model_copy(update={"vision": vision})
-            if card.model_id not in _card_cache:
-                _card_cache[card.model_id] = card
-        except (ValidationError, TOMLKitError):
-            pass
-
-
-async def _refresh_card_cache() -> None:
-    for path in _BUILTIN_CARD_DIRS:
-        await _load_cards_from_dir(path, is_custom=False)
-    await _load_cards_from_dir(_custom_cards_dir, is_custom=True)
-
-
 def _is_image_card(card: "ModelCard") -> bool:
     return any(t in (ModelTask.TextToImage, ModelTask.ImageToImage) for t in card.tasks)
-
-
-def get_card(model_id: ModelId) -> "ModelCard | None":
-    """Look up a single model card from the cache by ID."""
-    return _card_cache.get(model_id)
-
-
-async def get_model_cards() -> list["ModelCard"]:
-    if len(_card_cache) == 0:
-        await _refresh_card_cache()
-    if EXO_ENABLE_IMAGE_MODELS:
-        return list(_card_cache.values())
-    return [c for c in _card_cache.values() if not _is_image_card(c)]
 
 
 class ModelTask(str, Enum):
@@ -104,7 +141,7 @@ class ModelTask(str, Enum):
     ImageToImage = "ImageToImage"
 
 
-class ComponentInfo(CamelCaseModel):
+class ComponentInfo(FrozenModel):
     component_name: str
     component_path: str
     storage_size: Memory
@@ -113,7 +150,7 @@ class ComponentInfo(CamelCaseModel):
     safetensors_index_filename: str | None = None
 
 
-class VisionCardConfig(CamelCaseModel):
+class VisionCardConfig(FrozenModel):
     image_token_id: int
     model_type: str
     weights_repo: str = ""
@@ -121,9 +158,29 @@ class VisionCardConfig(CamelCaseModel):
     processor_repo: str | None = None
 
 
-class ModelCard(CamelCaseModel):
+class SamplingValues(FrozenModel):
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+
+
+class SamplingDefaults(SamplingValues):
+    thinking: SamplingValues | None = None
+    non_thinking: SamplingValues | None = None
+
+
+class ModelCard(FrozenModel):
     model_id: ModelId
     storage_size: Memory
+    # The memory the model takes once loaded, when it differs from storage_size (the
+    # download): for a model that never loads parts of its checkpoint, or leaves some
+    # weights on disk and reads them while running. Placement and the runner's memory
+    # sizing use it (see resident_size); downloads use storage_size.
+    memory_size: Memory | None = None
     n_layers: PositiveInt
     hidden_size: PositiveInt
     supports_tensor: bool
@@ -131,14 +188,33 @@ class ModelCard(CamelCaseModel):
     tasks: list[ModelTask]
     components: list[ComponentInfo] | None = None
     family: str = ""
+    # config.json `model_type` of the checkpoint. The master looks up the model's family
+    # (placement rules) by it; see exo.worker.engines.mlx.models.
+    model_type: str | None = None
     quantization: str = ""
     base_model: str = ""
     capabilities: list[str] = []
+    backends: list[Backend]
+    reasoning_dialect: ReasoningDialect = "none"
     context_length: int = 0
     uses_cfg: bool = False
     trust_remote_code: bool = True
     is_custom: bool = False
     vision: VisionCardConfig | None = None
+    sampling_defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
+
+    @property
+    def resident_size(self) -> Memory:
+        """The memory the model needs once loaded."""
+        return self.memory_size if self.memory_size is not None else self.storage_size
+
+    @model_validator(mode="after")
+    def _autodetect_vision(self) -> "ModelCard":
+        if self.vision is None:
+            detected = detect_vision_from_config(self.model_id)
+            if detected is not None:
+                object.__setattr__(self, "vision", detected)
+        return self
 
     @model_validator(mode="after")
     def _fill_vision_weights_repo(self) -> "ModelCard":
@@ -154,6 +230,11 @@ class ModelCard(CamelCaseModel):
     @classmethod
     def _validate_tasks(cls, v: list[str | ModelTask]) -> list[ModelTask]:
         return [item if isinstance(item, ModelTask) else ModelTask(item) for item in v]
+
+    @field_validator("backends", mode="before")
+    @classmethod
+    def _validate_backends(cls, v: list[str | Backend]) -> list[Backend]:
+        return [item if isinstance(item, Backend) else Backend(item) for item in v]
 
     async def save(self, path: Path) -> None:
         async with await open_file(path, "w") as f:
@@ -174,14 +255,13 @@ class ModelCard(CamelCaseModel):
     # Is it okay that model card.load defaults to network access if the card doesn't exist? do we want to be more explicit here?
     @staticmethod
     async def load(model_id: ModelId) -> "ModelCard":
-        if model_id not in _card_cache:
-            await _refresh_card_cache()
-        if (mc := _card_cache.get(model_id)) is not None:
+        if card_cache.get(model_id) is None:
+            await card_cache.refresh()
+        if (mc := card_cache.get(model_id)) is not None:
             return mc
 
         mc = await ModelCard.fetch_from_hf(model_id)
         await mc.save_to_custom_dir()
-        _card_cache[model_id] = mc
         return mc
 
     @staticmethod
@@ -208,22 +288,20 @@ class ModelCard(CamelCaseModel):
             trust_remote_code=False,
             is_custom=True,
             vision=config_data.vision,
+            backends=list(
+                Backend
+            ),  # all backends — we don't know what an arbitrary HF model supports; let placement gate decide
         )
 
 
-def add_to_card_cache(card: "ModelCard") -> None:
-    """Add or update a model card in the in-memory cache."""
-    _card_cache[card.model_id] = card
-
-
-async def delete_custom_card(model_id: ModelId) -> bool:
-    """Delete a user-added custom model card. Returns True if deleted."""
-    card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
-    if await card_path.exists():
-        await card_path.unlink()
-        _card_cache.pop(model_id, None)
-        return True
-    return False
+_LAYER_COUNT_KEYS = (
+    "num_hidden_layers",
+    "num_layers",
+    "n_layer",
+    "n_layers",
+    "num_decoder_layers",
+    "decoder_layers",
+)
 
 
 class ConfigData(BaseModel):
@@ -232,57 +310,42 @@ class ConfigData(BaseModel):
     architectures: list[str] | None = None
     hidden_size: Annotated[int, Field(ge=0)] | None = None
     num_key_value_heads: PositiveInt | None = None
-    layer_count: int = Field(
-        validation_alias=AliasChoices(
-            "num_hidden_layers",
-            "num_layers",
-            "n_layer",
-            "n_layers",
-            "num_decoder_layers",
-            "decoder_layers",
-        )
-    )
+    layer_count: int = Field(validation_alias=AliasChoices(*_LAYER_COUNT_KEYS))
     max_position_embeddings: int = 0
     vision: VisionCardConfig | None = None
 
     @property
     def supports_tensor(self) -> bool:
-        return self.architectures in [
-            ["Glm4MoeLiteForCausalLM"],
-            ["GlmMoeDsaForCausalLM"],
-            ["DeepseekV32ForCausalLM"],
-            ["DeepseekV3ForCausalLM"],
-            ["Qwen3NextForCausalLM"],
-            ["Qwen3MoeForCausalLM"],
-            ["Qwen3_5MoeForConditionalGeneration"],
-            ["Qwen3_5ForConditionalGeneration"],
-            ["MiniMaxM2ForCausalLM"],
-            ["LlamaForCausalLM"],
-            ["GptOssForCausalLM"],
-            ["Step3p5ForCausalLM"],
-            ["NemotronHForCausalLM"],
-            ["Gemma4ForConditionalGeneration"],
-        ]
+        return (
+            self.architectures is not None
+            and len(self.architectures) == 1
+            and self.architectures[0] in tensor_parallel_architectures()
+        )
 
     @model_validator(mode="before")
     @classmethod
     def defer_to_text_config(cls, data: dict[str, Any], info: ValidationInfo):
-        text_config = data.get("text_config")
+        # The language model's config: `text_config` in most multimodal checkpoints,
+        # `llm_config` in NVIDIA's Nemotron-H Omni ones.
+        text_config = data.get("text_config") or data.get("llm_config")
         if text_config is not None:
             for field in [
                 "architectures",
                 "hidden_size",
                 "num_key_value_heads",
                 "max_position_embeddings",
-                "num_hidden_layers",
-                "num_layers",
-                "n_layer",
-                "n_layers",
-                "num_decoder_layers",
-                "decoder_layers",
+                *_LAYER_COUNT_KEYS,
+                "layers_block_type",
             ]:
                 if (val := text_config.get(field)) is not None:  # pyright: ignore[reportAny]
                     data[field] = val
+
+        # Nemotron-H configs saved by transformers list their blocks instead of counting them.
+        block_types = data.get("layers_block_type")
+        if isinstance(block_types, list) and not any(
+            key in data for key in _LAYER_COUNT_KEYS
+        ):
+            data["num_hidden_layers"] = len(cast(list[object], block_types))
 
         vision_config = data.get("vision_config")
         image_token_id = data.get("image_token_id")
@@ -346,7 +409,7 @@ async def fetch_safetensors_size(model_id: ModelId) -> Memory:
         index_data = ModelSafetensorsIndex.model_validate_json(await f.read())
 
     metadata = index_data.metadata
-    if metadata is not None:
+    if metadata is not None and metadata.total_size is not None:
         return Memory.from_bytes(metadata.total_size)
 
     info = model_info(model_id)

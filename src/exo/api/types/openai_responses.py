@@ -407,12 +407,34 @@ class ResponseReasoningItem(BaseModel, frozen=True):
 ResponseItem = ResponseMessageItem | ResponseFunctionCallItem | ResponseReasoningItem
 
 
+class InputTokensDetails(BaseModel, frozen=True):
+    """Breakdown of input token counts in Responses API response."""
+
+    cached_tokens: int = 0
+
+
+class OutputTokensDetails(BaseModel, frozen=True):
+    """Breakdown of output token counts in Responses API response."""
+
+    reasoning_tokens: int = 0
+
+
 class ResponseUsage(BaseModel, frozen=True):
     """Token usage in Responses API response."""
 
     input_tokens: int
+    input_tokens_details: InputTokensDetails
     output_tokens: int
+    output_tokens_details: OutputTokensDetails
     total_tokens: int
+
+
+class ResponseError(BaseModel, frozen=True):
+    """Why a response failed. code is exo's error code (see exo.shared.request_errors), or
+    "server_error"."""
+
+    code: str
+    message: str
 
 
 class ResponsesResponse(BaseModel, frozen=True):
@@ -426,6 +448,7 @@ class ResponsesResponse(BaseModel, frozen=True):
     output: list[ResponseItem]
     output_text: str
     usage: ResponseUsage | None = None
+    error: ResponseError | None = None
 
 
 # Streaming event types
@@ -592,6 +615,14 @@ class ResponseCompletedEvent(BaseModel, frozen=True):
     response: ResponsesResponse
 
 
+class ResponseFailedEvent(BaseModel, frozen=True):
+    """Event sent instead of response.completed when the generation fails."""
+
+    type: Literal["response.failed"] = "response.failed"
+    sequence_number: int
+    response: ResponsesResponse
+
+
 ResponsesStreamEvent = (
     ResponseCreatedEvent
     | ResponseInProgressEvent
@@ -608,4 +639,5 @@ ResponsesStreamEvent = (
     | ResponseReasoningSummaryTextDoneEvent
     | ResponseReasoningSummaryPartDoneEvent
     | ResponseCompletedEvent
+    | ResponseFailedEvent
 )

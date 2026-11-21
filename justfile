@@ -16,14 +16,14 @@ check:
     uv run basedpyright --project pyproject.toml
 
 sync:
-    uv sync --all-packages
+    uv sync --all-packages --extra mlx
 
 sync-clean:
-    uv sync --all-packages --force-reinstall --no-cache
+    uv sync --all-packages --extra mlx --force-reinstall --no-cache
 
 rust-rebuild:
-    cargo run --bin stub_gen
-    uv sync --reinstall-package exo_pyo3_bindings
+    PYO3_PYTHON="$(uv run python -c 'import sys; print(sys.executable)')" cargo run --bin stub_gen
+    uv sync --reinstall-package exo_rs
 
 build-dashboard:
     #!/usr/bin/env bash
@@ -36,8 +36,8 @@ package: build-dashboard
     uv run pyinstaller packaging/pyinstaller/exo.spec
     rm -rf build
 
-build-app: package
-    xcodebuild build -project app/EXO/EXO.xcodeproj -scheme EXO -configuration Debug -derivedDataPath app/EXO/build
+build-app: rust-rebuild sync-clean package
+    env -u LD xcodebuild build -project app/EXO/EXO.xcodeproj -scheme EXO -configuration Debug -derivedDataPath app/EXO/build
     @echo "\nBuild complete. Run with:\n  open {{justfile_directory()}}/app/EXO/build/Build/Products/Debug/EXO.app"
 
 clean:

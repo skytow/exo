@@ -2,94 +2,158 @@ import argparse
 import multiprocessing as mp
 import os
 import resource
+import shutil
 import signal
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Self
 
 import anyio
+from anyio import to_thread
+from anyio.lowlevel import checkpoint as anyio_checkpoint
+from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
+from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
 
 import exo.routing.topics as topics
+from exo import __version__
+from exo.api.cluster_routes import ClusterRoutesServer
+from exo.api.listening_socket import ApiPortInUseError, listen_on_api_port
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
-from exo.download.impl_shard_downloader import exo_shard_downloader
+from exo.download.transfer import DownloadSettings
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
-from exo.routing.router import Router, get_node_id_keypair
-from exo.shared.constants import EXO_LOG
+from exo.routing.membership import Membership
+from exo.routing.router import Router, get_node_zid
+from exo.routing.wire import DEFAULT_CLUSTER_NAME, WIRE_VERSION, build_id
+from exo.shared.constants import (
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_DEPLOYMENTS_FILE,
+    EXO_EVENT_LOG_DIR,
+    EXO_LOG,
+    EXO_PID_FILE,
+)
+from exo.shared.deployment_store import DeploymentKeeper
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
+from exo.shared.serving import ServingReachability
 from exo.shared.types.common import NodeId, SessionId
+from exo.shared.types.events import NodeLeft
+from exo.shared.types.state import State
+from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.utils.exit_guard import exit_if_shutdown_hangs
+from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
 from exo.worker.main import Worker
+
+# Where the master used to keep every event of a session; removed when a node starts
+_OLD_MASTER_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "master"
+
+# A node that is quitting tells the master it is leaving, so the master removes it and the
+# models running on it at once instead of after NODE_SILENCE_TIMEOUT. It waits this long at most
+# for its departure to come back from the master (milliseconds when the master is reachable),
+# then shuts down anyway: a quit is never held up by an unreachable master.
+LEAVE_ANNOUNCE_TIMEOUT = 2.0
+# How often to look whether the departure has been applied
+LEAVE_POLL_INTERVAL = 0.05
+# A quitting master waits this long after its departure is applied before its network shuts
+# down, for the departure it indexed to leave the process. Its router queues each event for the
+# network before delivering it locally (TopicRouter.run), so this node's worker can see the
+# departure while the copy for the other nodes waits behind what was queued before it.
+# Handing one queued message to zenoh takes 0.5-1 ms (measured on an Apple-silicon Mac); zenoh
+# then writes it to every peer at once, holding it back for batching only under back-pressure,
+# for at most 1 ms. So 0.25 s hands the departure over behind about 200 queued messages, where a
+# master that keeps up with its events (fewer than about 1000 a second) has a handful. Should it
+# be lost anyway, the other nodes remove this one after their silence timeouts, as before.
+# A follower doesn't wait: the departure it saw came from the master, which has sent it to all.
+LEAVE_FLUSH = 0.25
 
 
 @dataclass
 class Node:
     router: Router
     event_router: EventRouter
+    membership: Membership
     download_coordinator: DownloadCoordinator | None
     worker: Worker | None
     election: Election  # Every node participates in election, as we do want a node to become master even if it isn't a master candidate if no master candidates are present.
     election_result_receiver: Receiver[ElectionResult]
     master: Master | None
     api: API | None
+    deployment_keeper: DeploymentKeeper
 
     node_id: NodeId
     offline: bool
+    _api_port: int
+    # With --no-api, a worker's models are still served to the cluster through these routes
+    cluster_routes: ClusterRoutesServer | None = None
+    # Which nodes serving requests treats as reachable (the membership's, see the class)
+    serving_reachability: ServingReachability | None = None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
+    # Set by the first quit signal, while the node announces its departure
+    _leaving: bool = field(init=False, default=False)
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        keypair = get_node_id_keypair()
-        node_id = NodeId(keypair.to_node_id())
+        # Take the API's port before starting anything, so a port in use fails fast and clearly.
+        # A worker always needs it: other nodes send it the requests for its models there.
+        api_listening_socket = (
+            listen_on_api_port(args.api_port)
+            if args.spawn_api or not args.no_worker
+            else None
+        )
+        node_id = get_node_zid()
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
-            keypair,
-            bootstrap_peers=args.bootstrap_peers,
-            listen_port=args.libp2p_port,
+            node_id,
+            namespace=args.namespace,
+            listen_port=args.zenoh_port,
+            discovery_service_port=args.discovery_port,
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
+        await router.register_topic(topics.STATE_SNAPSHOTS)
         await router.register_topic(topics.COMMANDS)
         await router.register_topic(topics.ELECTION_MESSAGES)
-        await router.register_topic(topics.CONNECTION_MESSAGES)
+        await router.register_topic(topics.MEMBERSHIP)
         await router.register_topic(topics.DOWNLOAD_COMMANDS)
         event_router = EventRouter(
             session_id,
             command_sender=router.sender(topics.COMMANDS),
             external_outbound=router.sender(topics.LOCAL_EVENTS),
             external_inbound=router.receiver(topics.GLOBAL_EVENTS),
+            snapshot_inbound=router.receiver(topics.STATE_SNAPSHOTS),
         )
 
+        membership = Membership(
+            node_id,
+            member_receiver=router.receiver(topics.MEMBERSHIP),
+            networking=router,
+            cluster_events=event_router.receiver(),
+        )
+        serving_reachability = ServingReachability(node_id, membership)
+
         logger.info(f"Starting node {node_id}")
+
+        # Errors the very first time exo is run as dir doesn't exist
+        EXO_DEFAULT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
         # Create DownloadCoordinator (unless --no-downloads)
         if not args.no_downloads:
             download_coordinator = DownloadCoordinator(
                 node_id,
-                exo_shard_downloader(offline=args.offline),
+                DownloadSettings(),
                 event_sender=event_router.sender(),
                 download_command_receiver=router.receiver(topics.DOWNLOAD_COMMANDS),
                 offline=args.offline,
             )
         else:
             download_coordinator = None
-
-        if args.spawn_api:
-            api = API(
-                node_id,
-                port=args.api_port,
-                event_receiver=event_router.receiver(),
-                command_sender=router.sender(topics.COMMANDS),
-                download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
-                election_receiver=router.receiver(topics.ELECTION_MESSAGES),
-            )
-        else:
-            api = None
 
         if not args.no_worker:
             worker = Worker(
@@ -98,19 +162,48 @@ class Node:
                 event_sender=event_router.sender(),
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
+                api_port=args.api_port,
+                reachability=serving_reachability,
             )
         else:
             worker = None
+
+        cluster_routes: ClusterRoutesServer | None = None
+        if args.spawn_api and api_listening_socket is not None:
+            api = API(
+                node_id,
+                port=args.api_port,
+                listening_socket=api_listening_socket,
+                event_receiver=event_router.receiver(),
+                command_sender=router.sender(topics.COMMANDS),
+                download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
+                election_receiver=router.receiver(topics.ELECTION_MESSAGES),
+                membership=membership,
+                devices_on_other_versions=router.devices_on_other_versions,
+                serving_host=worker.serving if worker is not None else None,
+                serving_reachability=serving_reachability,
+            )
+        else:
+            api = None
+            if api_listening_socket is not None and worker is not None:
+                serving_worker = worker
+                cluster_routes = ClusterRoutesServer(
+                    node_id,
+                    listening_socket=api_listening_socket,
+                    state=lambda: serving_worker.state,
+                    host=serving_worker.serving,
+                )
 
         # We start every node with a master
         master = Master(
             node_id,
             session_id,
-            event_sender=event_router.sender(),
             global_event_sender=router.sender(topics.GLOBAL_EVENTS),
+            snapshot_sender=router.sender(topics.STATE_SNAPSHOTS),
             local_event_receiver=router.receiver(topics.LOCAL_EVENTS),
             command_receiver=router.receiver(topics.COMMANDS),
             download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
+            membership=membership,
         )
 
         er_send, er_recv = channel[ElectionResult]()
@@ -122,30 +215,51 @@ class Node:
             # but ultimately it seems not worth the complexity
             election_message_sender=router.sender(topics.ELECTION_MESSAGES),
             election_message_receiver=router.receiver(topics.ELECTION_MESSAGES),
-            connection_message_receiver=router.receiver(topics.CONNECTION_MESSAGES),
+            membership_change_receiver=membership.changes(),
             command_receiver=router.receiver(topics.COMMANDS),
             election_result_sender=er_send,
+        )
+
+        # Every node keeps the deployments it has seen, for each new master
+        state_view = worker or api
+        deployment_keeper = DeploymentKeeper(
+            EXO_DEPLOYMENTS_FILE,
+            state=(lambda: state_view.state)
+            if state_view is not None
+            else lambda: None,
+            command_sender=router.sender(topics.COMMANDS),
         )
 
         return cls(
             router,
             event_router,
+            membership,
             download_coordinator,
             worker,
             election,
             er_recv,
             master,
             api,
+            deployment_keeper,
             node_id,
             args.offline,
+            args.api_port,
+            cluster_routes=cluster_routes,
+            serving_reachability=serving_reachability,
         )
 
     async def run(self):
+        await to_thread.run_sync(
+            partial(shutil.rmtree, _OLD_MASTER_EVENT_LOG_DIR, ignore_errors=True)
+        )
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
             signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
+            tg.start_soon(self.membership.run)
+            if self.serving_reachability:
+                tg.start_soon(self.serving_reachability.run)
             tg.start_soon(self.election.run)
             if self.download_coordinator:
                 tg.start_soon(self.download_coordinator.run)
@@ -155,15 +269,65 @@ class Node:
                 tg.start_soon(self.master.run)
             if self.api:
                 tg.start_soon(self.api.run)
+            tg.start_soon(self.deployment_keeper.run)
+            if self.cluster_routes:
+                tg.start_soon(self.cluster_routes.run)
             tg.start_soon(self._elect_loop)
 
     def shutdown(self):
-        # if this is our second call to shutdown, just sys.exit
-        if self._tg.cancel_called():
-            import sys
-
+        """Leave the cluster and stop. A second call (another Ctrl-C) exits at once."""
+        if self._leaving or self._tg.cancel_called():
             sys.exit(1)
-        self._tg.cancel_tasks()
+        self._leaving = True
+        self._tg.start_soon(self._leave_and_stop)
+
+    async def _leave_and_stop(self) -> None:
+        try:
+            announced = False
+            with anyio.move_on_after(LEAVE_ANNOUNCE_TIMEOUT) as scope:
+                announced = await self._announce_departure()
+            if scope.cancelled_caught:
+                logger.warning(
+                    f"The master didn't confirm this node's departure within "
+                    f"{LEAVE_ANNOUNCE_TIMEOUT:.0f}s; shutting down anyway"
+                )
+            elif announced and self.master is not None:
+                # The departure this master indexed may not have left the process yet
+                await anyio.sleep(LEAVE_FLUSH)
+        finally:
+            self._tg.cancel_tasks()
+
+    async def _announce_departure(self) -> bool:
+        """Tell the master this node is leaving, and wait until it has removed the node.
+        Returns whether there was anything to announce.
+
+        The departure removes the node as the master removes one it stopped hearing from, but
+        says it was a departure: the node's models wait LEAVE_GRACE (for a restart) before they
+        move. A node without a worker never joined the cluster's state, so it has nothing to
+        announce.
+        """
+        if self.worker is None:
+            return False
+        worker = self.worker
+        # Anything this node reports about itself after its departure would add it back: its
+        # info and connections, and its download statuses
+        worker.stop_reporting()
+        if self.download_coordinator is not None:
+            self.download_coordinator.stop_reporting()
+        logger.info("Announcing this node's departure to the cluster")
+        await self.event_router.sender().send(NodeLeft(node_id=self.node_id))
+        while _lists_node(worker.state, self.node_id):
+            await anyio.sleep(LEAVE_POLL_INTERVAL)
+        logger.info("The cluster has removed this node")
+        return True
+
+    def _cluster_state(self) -> State | None:
+        """The cluster state as this node last knew it, for a master it starts to carry on from."""
+        if self.worker:
+            return self.worker.state
+        if self.api:
+            return self.api.state
+        return None
 
     async def _elect_loop(self):
         with self.election_result_receiver as results:
@@ -177,25 +341,25 @@ class Node:
                 # Ok:
                 # On new master:
                 # - Elect master locally if necessary
-                # - Shutdown and re-create the worker
-                # - Shut down and re-create the API
+                # - Follow it, keeping the worker's runners and the API's state
 
                 if result.is_new_master:
-                    await anyio.sleep(0)
-                    self.event_router.shutdown()
-                    self.event_router = EventRouter(
-                        result.session_id,
-                        self.router.sender(topics.COMMANDS),
-                        self.router.receiver(topics.GLOBAL_EVENTS),
-                        self.router.sender(topics.LOCAL_EVENTS),
-                    )
-                    self._tg.start_soon(self.event_router.run)
+                    await anyio_checkpoint()
+                    # Follow the new master without tearing anything down: it carries on from
+                    # the cluster's state, so runners and model instances keep going
+                    self.event_router.switch_session(result.session_id)
+                    if self.worker:
+                        # Before anything from the new master can reach the worker
+                        self.worker.follow_new_master(result.session_id)
 
                 if (
                     result.session_id.master_node_id == self.node_id
                     and self.master is not None
                 ):
-                    logger.info("Node elected Master")
+                    assert not result.is_new_master, (
+                        "cannot be new master if we remain master"
+                    )
+                    logger.info("Node elected Master - maintaining self")
                 elif (
                     result.session_id.master_node_id == self.node_id
                     and self.master is None
@@ -204,13 +368,15 @@ class Node:
                     self.master = Master(
                         self.node_id,
                         result.session_id,
-                        event_sender=self.event_router.sender(),
                         global_event_sender=self.router.sender(topics.GLOBAL_EVENTS),
+                        snapshot_sender=self.router.sender(topics.STATE_SNAPSHOTS),
                         local_event_receiver=self.router.receiver(topics.LOCAL_EVENTS),
                         command_receiver=self.router.receiver(topics.COMMANDS),
                         download_command_sender=self.router.sender(
                             topics.DOWNLOAD_COMMANDS
                         ),
+                        membership=self.membership,
+                        initial_state=self._cluster_state(),
                     )
                     self._tg.start_soon(self.master.run)
                 elif (
@@ -227,57 +393,102 @@ class Node:
                         f"Node {result.session_id.master_node_id} elected master"
                     )
                 if result.is_new_master:
+                    # Downloads carry on; the new master may lack their statuses
                     if self.download_coordinator:
-                        await self.download_coordinator.shutdown()
-                        self.download_coordinator = DownloadCoordinator(
-                            self.node_id,
-                            exo_shard_downloader(offline=self.offline),
-                            event_sender=self.event_router.sender(),
-                            download_command_receiver=self.router.receiver(
-                                topics.DOWNLOAD_COMMANDS
-                            ),
-                            offline=self.offline,
-                        )
-                        self._tg.start_soon(self.download_coordinator.run)
+                        await self.download_coordinator.reannounce()
                     if self.worker:
-                        await self.worker.shutdown()
-                        # TODO: add profiling etc to resource monitor
-                        self.worker = Worker(
-                            self.node_id,
-                            event_receiver=self.event_router.receiver(),
-                            event_sender=self.event_router.sender(),
-                            command_sender=self.router.sender(topics.COMMANDS),
-                            download_command_sender=self.router.sender(
-                                topics.DOWNLOAD_COMMANDS
-                            ),
-                        )
-                        self._tg.start_soon(self.worker.run)
+                        await self.worker.announce_to_master()
+                    self.deployment_keeper.follow_new_master()
                     if self.api:
-                        self.api.reset(result.won_clock, self.event_router.receiver())
+                        self.api.follow_new_master(result.won_clock)
                 else:
                     if self.api:
                         self.api.unpause(result.won_clock)
 
 
+def _lists_node(state: State, node_id: NodeId) -> bool:
+    return state.topology.contains_node(node_id) or node_id in state.last_seen
+
+
 def main():
+    # Parse args first => --help or bad args don't require PID-locking
     args = Args.parse()
+
+    # Exit early if cannot acquire PID file
+    try:
+        pidfile = Pidfile(EXO_PID_FILE, 0o0600)
+    except PidfileError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(1) from e
+
+    try:
+        if args.legacy_daemon:
+            # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
+            # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
+            for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+                if stream is not None:
+                    stream.flush()
+            stdin = open(os.devnull, "r")  # noqa: SIM115
+            stdout = open(os.devnull, "w")  # noqa: SIM115
+            stderr = open(os.devnull, "w")  # noqa: SIM115
+
+            with DaemonContext(
+                detach_process=True,
+                files_preserve=[pidfile.as_raw_fd()],
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                # cleanup loose file descriptors (as long as they aren't stdio)
+                for f in (
+                    f for f in (stdin, stdout, stderr) if f.fileno() not in STDIO_FDS
+                ):
+                    f.close()
+
+                # 1) if daemonizing => fork then write PID
+                try:
+                    pidfile.write()
+                except PidfileError as e:
+                    print(e, file=sys.stderr)
+                    raise SystemExit(1) from e
+                main_inner(args)
+        else:
+            # 2) otherwise      => just write PID
+            try:
+                pidfile.write()
+            except PidfileError as e:
+                print(e, file=sys.stderr)
+                raise SystemExit(1) from e
+            main_inner(args)
+    finally:
+        pidfile.close()
+
+
+def main_inner(args: "Args"):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(max(soft, 65535), hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
     mp.set_start_method("spawn", force=True)
+
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
-    logger.info(f"{'=' * 40}")
-    logger.info(f"Starting EXO | pid={os.getpid()}")
-    logger.info(f"{'=' * 40}")
-    logger.info(f"EXO_LIBP2P_NAMESPACE: {os.getenv('EXO_LIBP2P_NAMESPACE')}")
+
+    logger.info(f"pid = {os.getpid()}")
+    if os.getenv("EXO_LIBP2P_NAMESPACE"):
+        logger.warning(
+            "EXO_LIBP2P_NAMESPACE is deprecated - use EXO_ZENOH_NAMESPACE instead"
+        )
+    logger.info(
+        f"Discovery namespace: {args.namespace} (wire version {WIRE_VERSION}, build "
+        f"{build_id()}: only nodes with all three the same connect)"
+    )
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
     if args.bootstrap_peers:
-        logger.info(f"Bootstrap peers: {args.bootstrap_peers}")
+        raise ValueError("Bootstrap peers has been temporarily removed")
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -291,7 +502,12 @@ def main():
         os.environ["EXO_FAST_SYNCH"] = "false"
         logger.info("FAST_SYNCH forced OFF")
 
-    node = anyio.run(Node.create, args)
+    try:
+        node = anyio.run(Node.create, args)
+    except ApiPortInUseError as error:
+        logger.error(str(error))
+        logger_cleanup()
+        raise SystemExit(1) from None
     try:
         anyio.run(node.run)
     except BaseException as exception:
@@ -302,9 +518,24 @@ def main():
     finally:
         logger.info("EXO Shutdown complete")
         logger_cleanup()
+        exit_if_shutdown_hangs(EXO_LOG)
 
 
-class Args(CamelCaseModel):
+def default_namespace(environ: Mapping[str, str]) -> str:
+    """Namespace used when --namespace isn't given: one name for every version of exo,
+    since the wire version and the build decide which nodes can talk.
+
+    EXO_LIBP2P_NAMESPACE is still honoured (with a deprecation warning at
+    startup) so clusters isolated before the zenoh migration stay isolated.
+    """
+    return (
+        environ.get("EXO_ZENOH_NAMESPACE")
+        or environ.get("EXO_LIBP2P_NAMESPACE")
+        or DEFAULT_CLUSTER_NAME
+    )
+
+
+class Args(FrozenModel):
     verbosity: int = 0
     force_master: bool = False
     spawn_api: bool = False
@@ -315,13 +546,24 @@ class Args(CamelCaseModel):
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    legacy_daemon: bool = False
     bootstrap_peers: list[str] = []
-    libp2p_port: int
+    namespace: str
+    zenoh_port: int
+    discovery_port: int
 
     @classmethod
     def parse(cls) -> Self:
-        parser = argparse.ArgumentParser(prog="EXO")
+        parser = argparse.ArgumentParser(
+            prog="exo",
+            description="Run an exo node: devices on the same network form a cluster that runs AI models together.",
+        )
         default_verbosity = 0
+        parser.add_argument(
+            "--version",
+            action="version",
+            version=f"exo {__version__}",
+        )
         parser.add_argument(
             "-q",
             "--quiet",
@@ -329,6 +571,7 @@ class Args(CamelCaseModel):
             const=-1,
             dest="verbosity",
             default=default_verbosity,
+            help="Only log warnings and errors",
         )
         parser.add_argument(
             "-v",
@@ -336,27 +579,33 @@ class Args(CamelCaseModel):
             action="count",
             dest="verbosity",
             default=default_verbosity,
+            help="Log debug messages too",
         )
         parser.add_argument(
             "-m",
             "--force-master",
             action="store_true",
             dest="force_master",
+            help="Prefer this node as the master that coordinates the cluster",
         )
         parser.add_argument(
             "--no-api",
             action="store_false",
             dest="spawn_api",
+            help="Don't serve the dashboard and API on this node (a node that runs models "
+            "still takes the cluster's requests for them on the API port)",
         )
         parser.add_argument(
             "--api-port",
             type=int,
             dest="api_port",
             default=52415,
+            help="Port for the dashboard and API (default: %(default)s)",
         )
         parser.add_argument(
             "--no-worker",
             action="store_true",
+            help="Don't run models on this node, only coordinate the cluster",
         )
         parser.add_argument(
             "--no-downloads",
@@ -372,7 +621,13 @@ class Args(CamelCaseModel):
         parser.add_argument(
             "--no-batch",
             action="store_true",
-            help="Disable continuous batching, use sequential generation",
+            # Developer option: disable continuous batching, use sequential generation
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--legacy-daemon",
+            action="store_true",
+            help="Run as a legacy SysV-style background daemon using double-fork daemonization",
         )
         parser.add_argument(
             "--bootstrap-peers",
@@ -381,14 +636,31 @@ class Args(CamelCaseModel):
             if os.getenv("EXO_BOOTSTRAP_PEERS")
             else [],
             dest="bootstrap_peers",
-            help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
+            # Temporarily removed: exo refuses to start when bootstrap peers are given
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
-            "--libp2p-port",
+            "--namespace",
+            type=str,
+            default=default_namespace(os.environ),
+            dest="namespace",
+            help="Discovery namespace, nodes with different namespaces will not connect, "
+            "nor will nodes that run incompatible versions of exo "
+            f"(env: EXO_ZENOH_NAMESPACE, defaults to {DEFAULT_CLUSTER_NAME!r}).",
+        )
+        parser.add_argument(
+            "--zenoh-port",
             type=int,
-            default=0,
-            dest="libp2p_port",
-            help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+            default=52414,
+            dest="zenoh_port",
+            help="TCP port that nodes connect to each other on (default: %(default)s)",
+        )
+        parser.add_argument(
+            "--discovery-port",
+            type=int,
+            default=52413,
+            dest="discovery_port",
+            help="UDP port used to find other nodes on the network (default: %(default)s)",
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(
@@ -396,13 +668,15 @@ class Args(CamelCaseModel):
             action="store_true",
             dest="fast_synch",
             default=None,
-            help="Force MLX FAST_SYNCH on (for JACCL backend)",
+            # Developer option: force MLX FAST_SYNCH on (by default only RDMA/JACCL instances use it)
+            help=argparse.SUPPRESS,
         )
         fast_synch_group.add_argument(
             "--no-fast-synch",
             action="store_false",
             dest="fast_synch",
-            help="Force MLX FAST_SYNCH off",
+            # Developer option: force MLX FAST_SYNCH off
+            help=argparse.SUPPRESS,
         )
 
         args = parser.parse_args()
