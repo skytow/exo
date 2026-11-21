@@ -1,5 +1,7 @@
 from .api import AddCustomModelParams as AddCustomModelParams
 from .api import AdvancedImageParams as AdvancedImageParams
+from .api import AwaitInstanceReadyMessage as AwaitInstanceReadyMessage
+from .api import AwaitInstanceTimeoutMessage as AwaitInstanceTimeoutMessage
 from .api import BenchChatCompletionRequest as BenchChatCompletionRequest
 from .api import BenchChatCompletionResponse as BenchChatCompletionResponse
 from .api import BenchImageGenerationResponse as BenchImageGenerationResponse
@@ -21,6 +23,10 @@ from .api import DeleteDownloadResponse as DeleteDownloadResponse
 from .api import DeleteInstanceResponse as DeleteInstanceResponse
 from .api import DeleteTracesRequest as DeleteTracesRequest
 from .api import DeleteTracesResponse as DeleteTracesResponse
+from .api import DeploymentConstraints as DeploymentConstraints
+from .api import (
+    DevicesOnOtherVersionsResponse as DevicesOnOtherVersionsResponse,
+)
 from .api import ErrorInfo as ErrorInfo
 from .api import ErrorResponse as ErrorResponse
 from .api import FinishReason as FinishReason
@@ -34,6 +40,8 @@ from .api import ImageGenerationTaskParams as ImageGenerationTaskParams
 from .api import ImageListItem as ImageListItem
 from .api import ImageListResponse as ImageListResponse
 from .api import ImageSize as ImageSize
+from .api import InstanceLinkBody as InstanceLinkBody
+from .api import InstanceLinkResponse as InstanceLinkResponse
 from .api import Logprobs as Logprobs
 from .api import LogprobsContentItem as LogprobsContentItem
 from .api import ModelList as ModelList
@@ -44,6 +52,7 @@ from .api import PlacementPreview as PlacementPreview
 from .api import PlacementPreviewResponse as PlacementPreviewResponse
 from .api import PowerUsage as PowerUsage
 from .api import PromptTokensDetails as PromptTokensDetails
+from .api import ResumeDeploymentResponse as ResumeDeploymentResponse
 from .api import StartDownloadParams as StartDownloadParams
 from .api import StartDownloadResponse as StartDownloadResponse
 from .api import StreamingChoiceResponse as StreamingChoiceResponse

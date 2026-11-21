@@ -14,6 +14,7 @@ from loguru import logger
 from pydantic import ValidationError
 
 from exo.shared.constants import EXO_CONFIG_FILE, EXO_DEFAULT_MODELS_DIR
+from exo.shared.types.backends import Backend
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
     DiskUsage,
@@ -33,6 +34,7 @@ from exo.utils.task_group import TaskGroup
 from .macmon import MacmonMetrics
 from .system_info import (
     get_friendly_name,
+    get_gpu_working_set,
     get_model_and_chip,
     get_network_interfaces,
     get_os_build_version,
@@ -353,6 +355,35 @@ async def _gather_iface_map() -> dict[str, str] | None:
     return ports
 
 
+def _has_nvml_cuda() -> bool:
+    try:
+        import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
+    except ImportError:
+        return False
+    try:
+        nvml.nvmlInit()
+        try:
+            return nvml.nvmlDeviceGetCount() > 0
+        finally:
+            nvml.nvmlShutdown()
+    except Exception:
+        return False
+
+
+class NodeBackends(TaggedModel):
+    backends: list[Backend]
+
+    @classmethod
+    async def gather(cls) -> Self:
+        backends: list[Backend] = [Backend.MlxCpu]
+        if IS_DARWIN:
+            backends.append(Backend.MlxMetal)
+        if await to_thread.run_sync(_has_nvml_cuda):
+            backends.append(Backend.MlxCuda)
+            backends.append(Backend.Vllm)
+        return cls(backends=backends)
+
+
 GatheredInfo = (
     MacmonMetrics
     | MemoryUsage
@@ -365,6 +396,7 @@ GatheredInfo = (
     | MiscData
     | StaticNodeInformation
     | NodeDiskUsage
+    | NodeBackends
 )
 
 
@@ -373,6 +405,7 @@ class InfoGatherer:
     info_sender: Sender[GatheredInfo]
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
     _psutil_enabled: bool = field(init=False, default=False)
+    _gpu_working_set: Memory | None = field(init=False, default=None)
 
     async def _can_read_macmon_metrics(self, macmon_path: str) -> bool:
         try:
@@ -411,6 +444,10 @@ class InfoGatherer:
         return True
 
     async def run(self):
+        try:
+            self._gpu_working_set = await to_thread.run_sync(get_gpu_working_set)
+        except Exception as e:
+            logger.opt(exception=e).warning("Error reading the GPU's working set")
         async with self._tg as tg:
             if IS_DARWIN:
                 tg.start_soon(self._monitor_macmon, 1)
@@ -427,6 +464,8 @@ class InfoGatherer:
             nc = await NodeConfig.gather()
             if nc is not None:
                 await self.info_sender.send(nc)
+
+            await self.info_sender.send(await NodeBackends.gather())
 
     def shutdown(self):
         self._tg.cancel_tasks()
@@ -488,7 +527,10 @@ class InfoGatherer:
         while True:
             try:
                 await self.info_sender.send(
-                    MemoryUsage.from_psutil(override_memory=override_memory)
+                    MemoryUsage.from_psutil(
+                        override_memory=override_memory,
+                        gpu_working_set=self._gpu_working_set,
+                    )
                 )
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering memory usage")
@@ -577,7 +619,9 @@ class InfoGatherer:
                                 delimiter=b"\n", max_bytes=8 * 1024
                             )
                             text = data.decode("utf-8", errors="replace").strip()
-                            metrics = MacmonMetrics.from_raw_json(text)
+                            metrics = MacmonMetrics.from_raw_json(
+                                text, self._gpu_working_set
+                            )
                         await self.info_sender.send(metrics)
             except TimeoutError:
                 logger.warning(
@@ -597,6 +641,14 @@ class InfoGatherer:
                     f"MacMon failed with return code {e.returncode}: {stderr_msg}"
                 )
                 self._tg.start_soon(self._monitor_memory_usage, 1)
+            except ProcessLookupError:
+                # usually throws by the process' context manager on exit
+                # when we ctrl+c, hence usually should be ignored;
+                # if anything else throws it, we explicitly don't care:
+                # process is dead anyways ;)
+                logger.warning(
+                    "Macmon process not found - shutting down macmon monitor"
+                )
             except Exception as e:
                 logger.opt(exception=e).warning("Error in macmon monitor")
                 self._tg.start_soon(self._monitor_memory_usage, 1)

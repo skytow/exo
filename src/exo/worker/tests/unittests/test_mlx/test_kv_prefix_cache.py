@@ -9,7 +9,6 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.sample_utils import make_sampler
 
 from exo.shared.types.common import ModelId
-from exo.shared.types.mlx import Model
 from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
 from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
@@ -19,6 +18,7 @@ from exo.worker.engines.mlx.cache import (
     make_kv_cache,
 )
 from exo.worker.engines.mlx.generator.generate import mlx_generate, prefill
+from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 from exo.worker.tests.unittests.test_mlx.conftest import (
     DEFAULT_GPT_OSS_CONFIG,
@@ -343,7 +343,7 @@ class TestKVPrefixCacheWithModel:
             )
 
     def test_mlx_generate_populates_cache(self, model_and_tokenizer):
-        """mlx_generate should save the cache after generation completes."""
+        """mlx_generate should save the post-prefill cache (before the decode loop)."""
         model, tokenizer = model_and_tokenizer
 
         kv_prefix_cache = KVPrefixCache(None)
@@ -356,7 +356,6 @@ class TestKVPrefixCacheWithModel:
         prompt_tokens = encode_prompt(tokenizer, prompt)
 
         # Consume the entire generator so the cache-saving code after yield runs
-        generated_tokens = 0
         for _response in mlx_generate(
             model=model,
             tokenizer=tokenizer,
@@ -365,13 +364,14 @@ class TestKVPrefixCacheWithModel:
             kv_prefix_cache=kv_prefix_cache,
             group=None,
         ):
-            generated_tokens += 1
+            pass
 
         assert len(kv_prefix_cache.prompts) == 1
         assert len(kv_prefix_cache.caches) == 1
-        # Cache should contain prompt + generated tokens
-        expected_length = len(prompt_tokens) + generated_tokens
-        assert cache_length(kv_prefix_cache.caches[0]) == expected_length
+        # add_kv_cache is called before the decode loop and stores a deepcopy of
+        # the cache as it is just after prefill + trim(2). Generation tokens are
+        # never written into the stored entry.
+        assert cache_length(kv_prefix_cache.caches[0]) == len(prompt_tokens) - 2
 
     def test_mlx_generate_second_call_gets_prefix_hit(self, model_and_tokenizer):
         """Second mlx_generate call with same prompt should get a prefix hit from stored cache."""

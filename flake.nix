@@ -45,11 +45,16 @@
       inputs.uv2nix.follows = "uv2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    nixglhost = {
+      url = "github:numtide/nix-gl-host";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   nixConfig = {
-    extra-trusted-public-keys = "exo.cachix.org-1:okq7hl624TBeAR3kV+g39dUFSiaZgLRkLsFBCuJ2NZI=";
-    extra-substituters = "https://exo.cachix.org";
+    extra-trusted-public-keys = "exo.cachix.org-1:okq7hl624TBeAR3kV+g39dUFSiaZgLRkLsFBCuJ2NZI= cache.nixos-cuda.org:74DUi4Ye579gUqzH4ziL9IyiJBlDpMRn9MBN8oNan9M=";
+    extra-substituters = "https://exo.cachix.org https://cache.nixos-cuda.org";
   };
 
   outputs = inputs:
@@ -70,12 +75,12 @@
       debug = true; # Enable options autocompletion
 
       perSystem = { config, self', pkgs, lib, system, ... }:
-        {
-          # Allow unfree for metal-toolchain (needed for Darwin Metal packages)
-          _module.args.pkgs = import inputs.nixpkgs {
+        let
+          pkgsArgs = {
             inherit system;
             config.allowUnfreePredicate = pkg: (pkg.pname or "") == "metal-toolchain";
             overlays = [
+              inputs.nixglhost.overlays.default
               (import ./nix/apple-sdk-overlay.nix)
               (final: _: {
                 macmon = final.rustPlatform.buildRustPackage {
@@ -92,13 +97,24 @@
               })
             ];
           };
+        in
+        {
+          # Allow unfree for metal-toolchain (needed for Darwin Metal packages)
+          _module.args = {
+            pkgs = import inputs.nixpkgs pkgsArgs;
+            unfreePkgs = import inputs.nixpkgs (pkgsArgs // { config.allowUnfree = true; });
+          };
           treefmt = {
             projectRootFile = "flake.nix";
             programs = {
               nixpkgs-fmt.enable = true;
               ruff-format = {
                 enable = true;
-                excludes = [ "rust/exo_pyo3_bindings/exo_pyo3_bindings.pyi" ];
+                excludes = [
+                  "rust/exo_rs/exo_rs.pyi"
+                  # vendored verbatim, see its header
+                  "src/exo/worker/engines/mlx/models/deepseek_v4/model.py"
+                ];
               };
               rustfmt = {
                 enable = true;
@@ -118,22 +134,12 @@
             };
           };
 
-          packages = lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin (
-            let
-              uvLock = builtins.fromTOML (builtins.readFile ./uv.lock);
-              mlxPackage = builtins.head (builtins.filter (p: p.name == "mlx" && p.source ? git) uvLock.package);
-              uvLockMlxVersion = mlxPackage.version;
-              uvLockMlxRev = builtins.elemAt (builtins.split "#" mlxPackage.source.git) 2;
-            in
-            {
-              metal-toolchain = pkgs.callPackage ./nix/metal-toolchain.nix { };
-              mlx = pkgs.callPackage ./nix/mlx.nix {
-                inherit (self'.packages) metal-toolchain;
-                inherit uvLockMlxVersion uvLockMlxRev;
-              };
-              default = self'.packages.exo;
-            }
-          );
+          packages = {
+            default = self'.packages.exo;
+          } //
+          lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+            metal-toolchain = pkgs.callPackage ./nix/metal-toolchain.nix { };
+          };
 
           devShells.default = with pkgs; pkgs.mkShell {
             inputsFrom = [ self'.checks.cargo-build ];
@@ -144,10 +150,8 @@
                 config.treefmt.build.wrapper
 
                 # PYTHON
-                self'.packages.python
+                self'.packages.exo.passthru.evenv
                 uv
-                ruff
-                basedpyright
 
                 # RUST
                 config.rust.toolchain
@@ -164,9 +168,6 @@
                 just
                 jq
               ]
-              ++ lib.optionals stdenv.isLinux [
-                unixtools.ifconfig
-              ]
               ++ lib.optionals stdenv.isDarwin [
                 macmon
               ];
@@ -174,7 +175,7 @@
             OPENSSL_NO_VENDOR = "1";
 
             shellHook = ''
-              export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${self'.packages.python}/lib"
+              export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${python313}/lib"
               ${lib.optionalString stdenv.isLinux ''
                 export LD_LIBRARY_PATH="${openssl.out}/lib:$LD_LIBRARY_PATH"
               ''}

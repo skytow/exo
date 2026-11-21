@@ -3,15 +3,16 @@ from collections.abc import Generator
 from typing import Annotated, Any, Literal, get_args
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from exo.routing.wire import DeviceOnOtherVersion
 from exo.shared.models.model_cards import ModelCard, ModelId
-from exo.shared.types.common import CommandId, NodeId
+from exo.shared.types.common import CommandId, DeploymentId, NodeId
 from exo.shared.types.memory import Memory
-from exo.shared.types.text_generation import ReasoningEffort
+from exo.shared.types.text_generation import ReasoningDialect, ReasoningEffort
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
 from exo.shared.types.worker.shards import Sharding, ShardMetadata
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.utils.pydantic_ext import FrozenModel
 
 FinishReason = Literal[
     "stop", "length", "tool_calls", "content_filter", "function_call", "error"
@@ -22,7 +23,9 @@ class ErrorInfo(BaseModel):
     message: str
     type: str
     param: str | None = None
-    code: int
+    # The HTTP status, or for a generation that failed, a stable code saying why (as
+    # OpenAI's "context_length_exceeded"): see GenerationErrorCode
+    code: int | str
 
 
 class ErrorResponse(BaseModel):
@@ -48,6 +51,7 @@ class ModelListModel(BaseModel):
     quantization: str = Field(default="")
     base_model: str = Field(default="")
     capabilities: list[str] = Field(default_factory=list)
+    reasoning_dialect: ReasoningDialect = "none"
 
 
 class ModelList(BaseModel):
@@ -185,6 +189,12 @@ class NodePowerStats(BaseModel, frozen=True):
     node_id: NodeId
     samples: int
     avg_sys_power: float
+    # Per-phase breakdown. Populated only when the caller marks a phase
+    # boundary (e.g. prefill -> generation); None otherwise.
+    prefill_avg_sys_power: float | None = None
+    generation_avg_sys_power: float | None = None
+    prefill_energy_joules: float | None = None
+    generation_energy_joules: float | None = None
 
 
 class PowerUsage(BaseModel, frozen=True):
@@ -192,6 +202,16 @@ class PowerUsage(BaseModel, frozen=True):
     nodes: list[NodePowerStats]
     total_avg_sys_power_watts: float
     total_energy_joules: float
+    # Split between the prefill (prompt-processing) phase and the
+    # generation/decode phase. Populated only when the caller marks a phase
+    # boundary; None otherwise. The two phase energies should sum to
+    # approximately `total_energy_joules` (modulo interpolation rounding).
+    prefill_seconds: float | None = None
+    generation_seconds: float | None = None
+    prefill_energy_joules: float | None = None
+    generation_energy_joules: float | None = None
+    prefill_avg_sys_power_watts: float | None = None
+    generation_avg_sys_power_watts: float | None = None
 
 
 class BenchChatCompletionResponse(ChatCompletionResponse):
@@ -256,8 +276,17 @@ class PlaceInstanceParams(BaseModel):
     min_nodes: int = 1
 
 
+class DeploymentConstraints(BaseModel):
+    """What the user fixed when launching: the model is only ever placed again with these.
+    Without them, a model that loses a device may come back on fewer devices."""
+
+    min_nodes: int = Field(default=1, ge=1)
+    pinned_nodes: list[NodeId] = []
+
+
 class CreateInstanceParams(BaseModel):
     instance: Instance
+    constraints: DeploymentConstraints | None = None
 
 
 class PlacementPreview(BaseModel):
@@ -282,6 +311,15 @@ class CreateInstanceResponse(BaseModel):
     message: str
     command_id: CommandId
     model_card: ModelCard
+    # The launched model: DELETE /instance/{deployment_id} stops it, even while it waits to
+    # be placed again
+    deployment_id: DeploymentId
+
+
+class ResumeDeploymentResponse(BaseModel):
+    message: str
+    command_id: CommandId
+    deployment_id: DeploymentId
 
 
 class DeleteInstanceResponse(BaseModel):
@@ -290,7 +328,27 @@ class DeleteInstanceResponse(BaseModel):
     instance_id: InstanceId
 
 
+class AwaitInstanceReadyMessage(BaseModel):
+    type: Literal["ready"] = "ready"
+    instance: Instance
+
+
+class AwaitInstanceTimeoutMessage(BaseModel):
+    type: Literal["timeout"] = "timeout"
+    message: str
+
+
 class CancelCommandResponse(BaseModel):
+    message: str
+    command_id: CommandId
+
+
+class InstanceLinkBody(BaseModel):
+    prefill_instances: list[InstanceId]
+    decode_instances: list[InstanceId]
+
+
+class InstanceLinkResponse(BaseModel):
     message: str
     command_id: CommandId
 
@@ -356,8 +414,7 @@ class BenchImageGenerationTaskParams(ImageGenerationTaskParams):
 class ImageEditsTaskParams(BaseModel):
     """Internal task params for image-editing requests."""
 
-    image_data: str = ""  # Base64-encoded image (empty when using chunked transfer)
-    total_input_chunks: int = 0
+    image_data: str = ""  # Base64-encoded image, sent inline to the nodes that run it
     prompt: str
     model: str
     n: int | None = 1
@@ -418,29 +475,48 @@ class ImageListResponse(BaseModel, frozen=True):
     data: list[ImageListItem]
 
 
-class StartDownloadParams(CamelCaseModel):
+class DevicesOnOtherVersionsResponse(FrozenModel):
+    """Devices this node hears on the network, under its cluster name, that can't join the
+    cluster because they run another version of exo"""
+
+    # This node's
+    wire_version: int
+    build_id: str
+    devices: list[DeviceOnOtherVersion]
+
+
+class StartDownloadParams(FrozenModel):
+    """What to download to a node: a shard, or a model from the catalogue in whole."""
+
     target_node_id: NodeId
-    shard_metadata: ShardMetadata
+    shard_metadata: ShardMetadata | None = None
+    model_id: ModelId | None = None
+
+    @model_validator(mode="after")
+    def _one_of_shard_or_model(self) -> "StartDownloadParams":
+        if (self.shard_metadata is None) == (self.model_id is None):
+            raise ValueError("give exactly one of shard_metadata and model_id")
+        return self
 
 
-class StartDownloadResponse(CamelCaseModel):
+class StartDownloadResponse(FrozenModel):
     command_id: CommandId
 
 
-class DeleteDownloadResponse(CamelCaseModel):
+class DeleteDownloadResponse(FrozenModel):
     command_id: CommandId
 
 
-class CancelDownloadParams(CamelCaseModel):
+class CancelDownloadParams(FrozenModel):
     target_node_id: NodeId
     model_id: ModelId
 
 
-class CancelDownloadResponse(CamelCaseModel):
+class CancelDownloadResponse(FrozenModel):
     command_id: CommandId
 
 
-class TraceEventResponse(CamelCaseModel):
+class TraceEventResponse(FrozenModel):
     name: str
     start_us: int
     duration_us: int
@@ -448,12 +524,12 @@ class TraceEventResponse(CamelCaseModel):
     category: str
 
 
-class TraceResponse(CamelCaseModel):
+class TraceResponse(FrozenModel):
     task_id: str
     traces: list[TraceEventResponse]
 
 
-class TraceCategoryStats(CamelCaseModel):
+class TraceCategoryStats(FrozenModel):
     total_us: int
     count: int
     min_us: int
@@ -461,31 +537,31 @@ class TraceCategoryStats(CamelCaseModel):
     avg_us: float
 
 
-class TraceRankStats(CamelCaseModel):
+class TraceRankStats(FrozenModel):
     by_category: dict[str, TraceCategoryStats]
 
 
-class TraceStatsResponse(CamelCaseModel):
+class TraceStatsResponse(FrozenModel):
     task_id: str
     total_wall_time_us: int
     by_category: dict[str, TraceCategoryStats]
     by_rank: dict[int, TraceRankStats]
 
 
-class TraceListItem(CamelCaseModel):
+class TraceListItem(FrozenModel):
     task_id: str
     created_at: str
     file_size: int
 
 
-class TraceListResponse(CamelCaseModel):
+class TraceListResponse(FrozenModel):
     traces: list[TraceListItem]
 
 
-class DeleteTracesRequest(CamelCaseModel):
+class DeleteTracesRequest(FrozenModel):
     task_ids: list[str]
 
 
-class DeleteTracesResponse(CamelCaseModel):
+class DeleteTracesResponse(FrozenModel):
     deleted: list[str]
     not_found: list[str]

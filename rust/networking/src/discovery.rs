@@ -1,390 +1,752 @@
-use crate::ext::MultiaddrExt;
-use delegate::delegate;
-use either::Either;
-use futures_lite::FutureExt;
-use futures_timer::Delay;
-use libp2p::core::transport::PortUse;
-use libp2p::core::{ConnectedPoint, Endpoint};
-use libp2p::swarm::behaviour::ConnectionEstablished;
-use libp2p::swarm::dial_opts::DialOpts;
-use libp2p::swarm::{
-    CloseConnection, ConnectionClosed, ConnectionDenied, ConnectionHandler,
-    ConnectionHandlerSelect, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-    THandlerOutEvent, ToSwarm, dummy,
+use std::{
+    collections::VecDeque,
+    io,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use libp2p::{Multiaddr, PeerId, identity, mdns};
-use std::collections::{BTreeSet, HashMap};
-use std::convert::Infallible;
-use std::io;
-use std::net::IpAddr;
-use std::task::{Context, Poll};
-use std::time::Duration;
-use util::wakerdeque::WakerDeque;
 
-const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
+use bytemuck::{Pod, Zeroable};
+use log::{debug, info, trace, warn};
+use netwatcher::WatchHandle;
+use parking_lot::Mutex;
+use tokio::{
+    net::UdpSocket,
+    time::{Interval, MissedTickBehavior, interval},
+};
+use zenoh::config::ZenohId;
 
-mod managed {
-    use libp2p::swarm::NetworkBehaviour;
-    use libp2p::{identity, mdns, ping};
-    use std::io;
-    use std::time::Duration;
+// The stall guard uses the membership's stall rule and hold-off, so the two agree on when this
+// node was stopped (a sleep included) and on how long it holds off afterwards
+use crate::membership::{HOLD_OFF, Now, TICK, stall};
+use crate::wire::{ClusterKey, OtherVersions, Peer, PeerVersion};
 
-    const MDNS_RECORD_TTL: Duration = Duration::from_secs(2_500);
-    const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(1_500);
-    const PING_TIMEOUT: Duration = Duration::from_millis(2_500);
-    const PING_INTERVAL: Duration = Duration::from_millis(2_500);
+const GROUP: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xe0a1, 0xde89);
+const MAGIC: [u8; 3] = *b"EXO";
+/// Replies to any of our last few Hellos are accepted. A reply can arrive after the next
+/// Hello has gone out (the peer, or this loop, was busy), and insisting on the latest nonce
+/// meant a slow peer was never discovered.
+const RECENT_NONCES: usize = 8;
+/// How often to repeat the warning while no Hello can be sent at all.
+const BLOCKED_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to repeat that an exo with another version or namespace is on the network (and,
+/// separately, that a device in this namespace runs another version).
+const OTHER_CLUSTER_NOTICE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Test hook, for exo.testkit only: when set, Hellos go to these loopback addresses
+/// (comma-separated, such as `[::1]:40000`) instead of the multicast group. exo's
+/// single-machine cluster tests point it at their discovery relay: nodes on one machine can't
+/// find each other by multicast, because they share the discovery port and a unicast reply to
+/// it reaches only one of them (and on macOS a process without Local Network access can't send
+/// multicast at all). Only loopback addresses are taken, so it can't make a node announce
+/// itself anywhere off this machine. Outside those tests it is unset and discovery is
+/// unchanged.
+pub const ANNOUNCE_TO_ENV: &str = "EXO_TESTKIT_DISCOVERY_ANNOUNCE_TO";
 
-    #[derive(NetworkBehaviour)]
-    pub struct Behaviour {
-        mdns: mdns::tokio::Behaviour,
-        ping: ping::Behaviour,
-    }
-
-    impl Behaviour {
-        pub fn new(keypair: &identity::Keypair) -> io::Result<Self> {
-            Ok(Self {
-                mdns: mdns_behaviour(keypair)?,
-                ping: ping_behaviour(),
-            })
-        }
-    }
-
-    fn mdns_behaviour(keypair: &identity::Keypair) -> io::Result<mdns::tokio::Behaviour> {
-        use mdns::{Config, tokio};
-
-        // mDNS config => enable IPv6
-        let mdns_config = Config {
-            ttl: MDNS_RECORD_TTL,
-            query_interval: MDNS_QUERY_INTERVAL,
-
-            // enable_ipv6: true, // TODO: for some reason, TCP+mDNS don't work well with ipv6?? figure out how to make work
-            ..Default::default()
-        };
-
-        let mdns_behaviour = tokio::Behaviour::new(mdns_config, keypair.public().to_peer_id());
-        Ok(mdns_behaviour?)
-    }
-
-    fn ping_behaviour() -> ping::Behaviour {
-        ping::Behaviour::new(
-            ping::Config::new()
-                .with_timeout(PING_TIMEOUT)
-                .with_interval(PING_INTERVAL),
-        )
-    }
+pub struct Discovery {
+    sock: Arc<UdpSocket>,
+    ifaces: Arc<Mutex<Vec<SocketAddrV6>>>,
+    cluster: ClusterKey,
+    other_versions: OtherVersions,
+    recent_nonces: Mutex<RecentNonces>,
+    /// the port of the service we are doing discovery for - transmitted to peers
+    listen_port: u16,
+    zid: ZenohId,
+    tick: Interval,
+    /// When we last warned that no Hello could be sent; `None` while sending works.
+    blocked_since_warning: Mutex<Option<Instant>>,
+    other_cluster_notice: Mutex<OtherClusterNotice>,
+    other_version_notice: Mutex<OtherClusterNotice>,
+    stall_guard: StallGuard,
+    /// Where Hellos go instead of the multicast group (`ANNOUNCE_TO_ENV`), if anywhere
+    announce_to: Option<Vec<SocketAddrV6>>,
+    _sync: Mutex<WatchHandle>,
 }
 
-/// Events for when a listening connection is truly established and truly closed.
-#[derive(Debug, Clone)]
-pub enum Event {
-    ConnectionEstablished {
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        remote_ip: IpAddr,
-        remote_tcp_port: u16,
-    },
-    ConnectionClosed {
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        remote_ip: IpAddr,
-        remote_tcp_port: u16,
-    },
+#[derive(Debug, Clone, Copy)]
+pub struct Discovered {
+    pub zid: ZenohId,
+    pub addr: SocketAddrV6,
 }
 
-/// Discovery behavior that wraps mDNS to produce truly discovered durable peer-connections.
-///
-/// The behaviour operates as such:
-///  1) All true (listening) connections/disconnections are tracked, emitting corresponding events
-///     to the swarm.
-///  1) mDNS discovered/expired peers are tracked; discovered but not connected peers are dialed
-///     immediately, and expired but connected peers are disconnected from immediately.
-///  2) Every fixed interval: discovered but not connected peers are dialed, and expired but
-///     connected peers are disconnected from.
-pub struct Behaviour {
-    // state-tracking for managed behaviors & mDNS-discovered peers
-    managed: managed::Behaviour,
-    mdns_discovered: HashMap<PeerId, BTreeSet<Multiaddr>>,
-    bootstrap_peers: Vec<Multiaddr>,
-
-    retry_delay: Delay, // retry interval
-
-    // pending events to emmit => waker-backed Deque to control polling
-    pending_events: WakerDeque<ToSwarm<Event, Infallible>>,
-}
-
-impl Behaviour {
-    pub fn new(keypair: &identity::Keypair, bootstrap_peers: Vec<Multiaddr>) -> io::Result<Self> {
-        Ok(Self {
-            managed: managed::Behaviour::new(keypair)?,
-            mdns_discovered: HashMap::new(),
-            bootstrap_peers,
-            retry_delay: Delay::new(RETRY_CONNECT_INTERVAL),
-            pending_events: WakerDeque::new(),
-        })
-    }
-
-    fn dial(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        self.pending_events.push_back(ToSwarm::Dial {
-            opts: DialOpts::peer_id(peer_id).addresses(vec![addr]).build(),
-        })
-    }
-
-    fn close_connection(&mut self, peer_id: PeerId, connection: ConnectionId) {
-        // push front to make this IMMEDIATE
-        self.pending_events.push_front(ToSwarm::CloseConnection {
-            peer_id,
-            connection: CloseConnection::One(connection),
-        })
-    }
-
-    fn handle_mdns_discovered(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
-        for (p, ma) in peers {
-            self.dial(p, ma.clone()); // always connect
-
-            // get peer's multi-addresses or insert if missing
-            let Some(mas) = self.mdns_discovered.get_mut(&p) else {
-                self.mdns_discovered.insert(p, BTreeSet::from([ma]));
-                continue;
-            };
-
-            // multiaddress should never already be present - else something has gone wrong
-            let is_new_addr = mas.insert(ma);
-            assert!(is_new_addr, "cannot discover a discovered peer");
-        }
-    }
-
-    fn handle_mdns_expired(&mut self, peers: Vec<(PeerId, Multiaddr)>) {
-        for (p, ma) in peers {
-            // at this point, we *must* have the peer
-            let mas = self
-                .mdns_discovered
-                .get_mut(&p)
-                .expect("nonexistent peer cannot expire");
-
-            // at this point, we *must* have the multiaddress
-            let was_present = mas.remove(&ma);
-            assert!(was_present, "nonexistent multiaddress cannot expire");
-
-            // if empty, remove the peer-id entirely
-            if mas.is_empty() {
-                self.mdns_discovered.remove(&p);
-            }
-        }
-    }
-
-    fn on_connection_established(
-        &mut self,
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        remote_ip: IpAddr,
-        remote_tcp_port: u16,
-    ) {
-        // send out connected event
-        self.pending_events
-            .push_back(ToSwarm::GenerateEvent(Event::ConnectionEstablished {
-                peer_id,
-                connection_id,
-                remote_ip,
-                remote_tcp_port,
-            }));
-    }
-
-    fn on_connection_closed(
-        &mut self,
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        remote_ip: IpAddr,
-        remote_tcp_port: u16,
-    ) {
-        // send out disconnected event
-        self.pending_events
-            .push_back(ToSwarm::GenerateEvent(Event::ConnectionClosed {
-                peer_id,
-                connection_id,
-                remote_ip,
-                remote_tcp_port,
-            }));
-    }
-}
-
-impl NetworkBehaviour for Behaviour {
-    type ConnectionHandler =
-        ConnectionHandlerSelect<dummy::ConnectionHandler, THandler<managed::Behaviour>>;
-    type ToSwarm = Event;
-
-    // simply delegate to underlying mDNS behaviour
-
-    delegate! {
-        to self.managed {
-            fn handle_pending_inbound_connection(&mut self, connection_id: ConnectionId, local_addr: &Multiaddr, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied>;
-            fn handle_pending_outbound_connection(&mut self, connection_id: ConnectionId, maybe_peer: Option<PeerId>, addresses: &[Multiaddr], effective_role: Endpoint) -> Result<Vec<Multiaddr>, ConnectionDenied>;
-        }
-    }
-
-    fn handle_established_inbound_connection(
-        &mut self,
-        connection_id: ConnectionId,
-        peer: PeerId,
-        local_addr: &Multiaddr,
-        remote_addr: &Multiaddr,
-    ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(ConnectionHandler::select(
-            dummy::ConnectionHandler,
-            self.managed.handle_established_inbound_connection(
-                connection_id,
-                peer,
-                local_addr,
-                remote_addr,
-            )?,
-        ))
-    }
-
-    #[allow(clippy::needless_question_mark)]
-    fn handle_established_outbound_connection(
-        &mut self,
-        connection_id: ConnectionId,
-        peer: PeerId,
-        addr: &Multiaddr,
-        role_override: Endpoint,
-        port_use: PortUse,
-    ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(ConnectionHandler::select(
-            dummy::ConnectionHandler,
-            self.managed.handle_established_outbound_connection(
-                connection_id,
-                peer,
-                addr,
-                role_override,
-                port_use,
-            )?,
-        ))
-    }
-
-    fn on_connection_handler_event(
-        &mut self,
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        event: THandlerOutEvent<Self>,
-    ) {
-        match event {
-            Either::Left(ev) => libp2p::core::util::unreachable(ev),
-            Either::Right(ev) => {
-                self.managed
-                    .on_connection_handler_event(peer_id, connection_id, ev)
-            }
-        }
-    }
-
-    // hook into these methods to drive behavior
-
-    fn on_swarm_event(&mut self, event: FromSwarm) {
-        self.managed.on_swarm_event(event); // let mDNS handle swarm events
-
-        // handle swarm events to update internal state:
-        match event {
-            FromSwarm::ConnectionEstablished(ConnectionEstablished {
-                peer_id,
-                connection_id,
-                endpoint,
-                ..
-            }) => {
-                let remote_address = match endpoint {
-                    ConnectedPoint::Dialer { address, .. } => address,
-                    ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
-                };
-
-                if let Some((ip, port)) = remote_address.try_to_tcp_addr() {
-                    // handle connection established event which is filtered correctly
-                    self.on_connection_established(peer_id, connection_id, ip, port)
-                }
-            }
-            FromSwarm::ConnectionClosed(ConnectionClosed {
-                peer_id,
-                connection_id,
-                endpoint,
-                ..
-            }) => {
-                let remote_address = match endpoint {
-                    ConnectedPoint::Dialer { address, .. } => address,
-                    ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
-                };
-
-                if let Some((ip, port)) = remote_address.try_to_tcp_addr() {
-                    // handle connection closed event which is filtered correctly
-                    self.on_connection_closed(peer_id, connection_id, ip, port)
-                }
-            }
-
-            // since we are running TCP/IP transport layer, we are assuming that
-            // no address changes can occur, hence encountering one is a fatal error
-            FromSwarm::AddressChange(a) => {
-                unreachable!("unhandlable: address change encountered: {:?}", a)
-            }
-            _ => {}
-        }
-    }
-
-    fn poll(&mut self, cx: &mut Context) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
-        // delegate to managed behaviors for any behaviors they need to perform
-        match self.managed.poll(cx) {
-            Poll::Ready(ToSwarm::GenerateEvent(e)) => {
-                match e {
-                    // handle discovered and expired events from mDNS
-                    managed::BehaviourEvent::Mdns(e) => match e.clone() {
-                        mdns::Event::Discovered(peers) => {
-                            self.handle_mdns_discovered(peers);
+impl Discovery {
+    pub async fn new(
+        zid: ZenohId,
+        cluster: ClusterKey,
+        other_versions: OtherVersions,
+        listen_port: u16,
+        discovery_port: u16,
+    ) -> io::Result<Self> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+        sock.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, discovery_port, 0, 0).into())?;
+        sock.set_nonblocking(true)?;
+        sock.set_multicast_loop_v6(true)?;
+        let sock = Arc::new(UdpSocket::from_std(sock.into())?);
+        let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
+        let _sync = Mutex::new(
+            netwatcher::watch_interfaces_with_callback({
+                let sock = sock.clone();
+                let ifaces = ifaces.clone();
+                move |update| {
+                    for (iface_idx, iface) in update.interfaces.iter() {
+                        if iface
+                            .ipv6_ips()
+                            .all(|addr| addr.is_loopback() || addr.is_unspecified())
+                        {
+                            continue;
                         }
-                        mdns::Event::Expired(peers) => {
-                            self.handle_mdns_expired(peers);
-                        }
-                    },
 
-                    // handle ping events => if error then disconnect
-                    managed::BehaviourEvent::Ping(e) => {
-                        if let Err(_) = e.result {
-                            self.close_connection(e.peer, e.connection.clone())
+                        match sock.join_multicast_v6(&GROUP, *iface_idx) {
+                            Ok(()) => ifaces.lock().push(SocketAddrV6::new(
+                                GROUP,
+                                discovery_port,
+                                0,
+                                *iface_idx,
+                            )),
+                            Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
+                                // skip AddrInUse - just means we've already joined the mv6
+                                if let Some(iface) = update.interfaces.get(&iface_idx) {
+                                    warn!(
+                                        "failed to join multicast v6 for interface {}: {e}",
+                                        iface.name
+                                    )
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for iface_idx in update.diff.removed {
+                        ifaces.lock().retain(|addr| addr.scope_id() != iface_idx);
+
+                        if let Err(e) = sock.leave_multicast_v6(&GROUP, iface_idx) {
+                            if let Some(iface) = update.interfaces.get(&iface_idx) {
+                                warn!(
+                                    "failed to leave multicast v6 for interface {}: {e}",
+                                    iface.name
+                                )
+                            }
                         }
                     }
                 }
+            })
+            // todo: better error handling here
+            .expect("failed to bind discovery watcher"),
+        );
+        Ok(Self {
+            sock,
+            cluster,
+            other_versions,
+            ifaces,
+            recent_nonces: Mutex::new(RecentNonces::default()),
+            listen_port,
+            zid,
+            tick: {
+                // After a stall, announce once rather than in a burst of missed ticks
+                let mut tick = interval(TICK);
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                tick
+            },
+            blocked_since_warning: Mutex::new(None),
+            other_cluster_notice: Mutex::new(OtherClusterNotice::default()),
+            other_version_notice: Mutex::new(OtherClusterNotice::default()),
+            stall_guard: StallGuard::default(),
+            announce_to: announce_to_from_env(),
+            _sync,
+        })
+    }
 
-                // since we just consumed an event, we should immediately wake just in case
-                // there are more events to come where that came from
-                cx.waker().wake_by_ref();
-            }
-
-            // forward any other mDNS event to the swarm or its connection handler(s)
-            Poll::Ready(e) => {
-                return Poll::Ready(
-                    e.map_out(|_| unreachable!("events returning to swarm already handled"))
-                        .map_in(Either::Right),
-                );
-            }
-
-            Poll::Pending => {}
-        }
-
-        // retry connecting to all mDNS peers periodically (fails safely if already connected)
-        if self.retry_delay.poll(cx).is_ready() {
-            for (p, mas) in self.mdns_discovered.clone() {
-                for ma in mas {
-                    self.dial(p, ma)
+    pub async fn next(&mut self) -> io::Result<Discovered> {
+        let mut buf = [0u8; Hello::buf_size() + WhatsUp::buf_size() + 1];
+        loop {
+            tokio::select! {
+                // The tick first: after a stall it tells us so before any queued message is handled
+                biased;
+                _ = self.tick.tick() => {
+                    if let Some(late) = self.stall_guard.on_tick(Now::read()) {
+                        warn!(
+                            "this node was unresponsive for {late:.0?}; ignoring peers for \
+                             {HOLD_OFF:?} so stale sessions close before reconnecting"
+                        );
+                    }
+                    self.announce().await?;
+                }
+                res = self.sock.recv_from(&mut buf) => {
+                    let Ok((bytes_read, addr)) = res else { continue; };
+                    if let Some(discovered) = self.respond(bytes_read, addr, &buf).await? {
+                        return Ok(discovered)
+                    }
                 }
             }
-            // dial bootstrap peers (for environments where mDNS is unavailable)
-            for addr in &self.bootstrap_peers {
-                self.pending_events.push_back(ToSwarm::Dial {
-                    opts: DialOpts::unknown_peer_id().address(addr.clone()).build(),
-                })
+        }
+    }
+
+    async fn respond(
+        &mut self,
+        bytes_read: usize,
+        addr: SocketAddr,
+        buf: &[u8],
+    ) -> io::Result<Option<Discovered>> {
+        if self.stall_guard.holding_off(Instant::now()) {
+            trace!("dropped: holding off after a stall");
+            return Ok(None);
+        }
+        trace!(
+            "raw recv: {bytes_read} bytes from {addr}: {:02x?}",
+            &buf[..bytes_read]
+        );
+        if bytes_read < size_of::<Header>() {
+            trace!("dropped: early EOF");
+            return Ok(None);
+        }
+        let header: &Header = bytemuck::from_bytes(&buf[0..size_of::<Header>()]);
+        if header.magic != MAGIC {
+            trace!("dropped: wrong magic");
+            return Ok(None);
+        }
+        let Ok(kind) = header.kind.try_into() else {
+            trace!("dropped: unknown message kind {}", header.kind);
+            return Ok(None);
+        };
+        match kind {
+            Kind::Hello => {
+                let total = Hello::buf_size();
+                if bytes_read != total {
+                    trace!("dropped: hello wrong size");
+                    return Ok(None);
+                }
+                let hello: &Hello = bytemuck::from_bytes(&buf[size_of::<Header>()..total]);
+                if self.recent_nonces.lock().contains(hello.nonce) {
+                    trace!("dropped: local hello nonce");
+                    return Ok(None);
+                }
+                match self.cluster.classify(&hello.namespace) {
+                    Peer::Compatible => {}
+                    Peer::OtherVersion(version) => {
+                        self.heard_another_version(version, hello.nonce, addr);
+                        return Ok(None);
+                    }
+                    Peer::OtherCluster => {
+                        trace!("dropped: different namespace");
+                        if self.other_cluster_notice.lock().due(Instant::now()) {
+                            info!(
+                                "found another exo at {} that can't join this cluster: it runs a \
+                             different version of exo, or was started with a different \
+                             namespace. Nodes connect only when both match, so update every \
+                             device to the same version of exo.",
+                                addr.ip()
+                            );
+                        }
+                        return Ok(None);
+                    }
+                }
+
+                // reply
+                trace!("replying to Hello({:?})", hello.nonce);
+                let reply = WhatsUp {
+                    nonce: hello.nonce,
+                    zid: self.zid.to_le_bytes(),
+                    port_le: self.listen_port.to_le_bytes(),
+                }
+                .alloc();
+
+                // One attempt only: retrying here would stall this loop (and with it our own
+                // announcements and every other reply), and the peer says Hello again every
+                // second anyway.
+                match self.sock.send_to(&reply, addr).await {
+                    Ok(sent) => trace!("sent {sent} bytes to {addr}"),
+                    Err(e) => debug!("send to {addr} failed: {e}"),
+                }
+                Ok(None)
             }
-            self.retry_delay.reset(RETRY_CONNECT_INTERVAL) // reset timeout
+            Kind::WhatsUp => {
+                let total = WhatsUp::buf_size();
+                if bytes_read != total {
+                    trace!("dropped: whatsup wrong size");
+                    return Ok(None);
+                }
+                let whats_up: &WhatsUp = bytemuck::from_bytes(&buf[size_of::<Header>()..total]);
+                if !self.recent_nonces.lock().contains(whats_up.nonce) {
+                    trace!("dropped: stale nonce");
+                    return Ok(None);
+                }
+                let SocketAddr::V6(v6) = addr else {
+                    trace!("dropped: v4 addr used");
+                    return Ok(None);
+                };
+                let Ok(zid) = ZenohId::try_from(&whats_up.zid[..]) else {
+                    trace!("dropped: zenoh conversion failed");
+                    return Ok(None);
+                };
+                if zid == self.zid {
+                    trace!("dropped: self zenoh id");
+                    return Ok(None);
+                }
+                // discovery success!
+                // the incoming port is our listen port;
+                // overwrite it with the whats_up port corresponding to the remote zenoh service
+                let addr = {
+                    let mut x = v6;
+                    x.set_port(u16::from_le_bytes(whats_up.port_le));
+                    x
+                };
+                Ok(Some(Discovered { addr, zid }))
+            }
         }
+    }
 
-        // send out any pending events from our own service
-        if let Some(e) = self.pending_events.pop_front(cx) {
-            return Poll::Ready(e.map_in(Either::Left));
+    /// Notes a Hello from our cluster that can't join, and says so (rate-limited).
+    fn heard_another_version(&self, version: PeerVersion, hello: [u8; 8], addr: SocketAddr) {
+        trace!("dropped: {version}");
+        let now = Instant::now();
+        self.other_versions.heard(addr.ip(), version, hello, now);
+        if self.other_version_notice.lock().due(now) {
+            let what = match version {
+                PeerVersion::Build => "another build of exo",
+                PeerVersion::Wire(_) | PeerVersion::Unversioned => "another version of exo",
+            };
+            warn!(
+                "a device at {} runs {what} ({version}; this one runs {}), so it can't join \
+                 this cluster. Devices connect only when they run the same build: update both \
+                 devices to the same version of exo.",
+                addr.ip(),
+                self.cluster.describe()
+            );
         }
+    }
 
-        // wait for pending events
-        Poll::Pending
+    async fn announce(&self) -> io::Result<()> {
+        let nonce = rand::random();
+        self.recent_nonces.lock().push(nonce);
+        let buf = Hello {
+            nonce,
+            namespace: self.cluster.hash(),
+        }
+        .alloc();
+
+        let addrs = match &self.announce_to {
+            Some(targets) => targets.clone(),
+            None => self.ifaces.lock().clone(),
+        };
+        debug!("announcing Hello({nonce:?}) to {addrs:?}");
+        match send_to_all(&self.sock, &buf, &addrs).await {
+            Ok(()) => {
+                if self.blocked_since_warning.lock().take().is_some() {
+                    info!("peer discovery can send again");
+                }
+            }
+            Err(e) => {
+                let warning_due = {
+                    let mut last_warning = self.blocked_since_warning.lock();
+                    let due =
+                        last_warning.is_none_or(|at| at.elapsed() >= BLOCKED_WARNING_INTERVAL);
+                    if due {
+                        *last_warning = Some(Instant::now());
+                    }
+                    due
+                };
+                if warning_due {
+                    warn!(
+                        "peer discovery could not send on any network interface ({e}), so other \
+                         nodes cannot find this one. On macOS this usually means Local Network \
+                         access is blocked for this process: allow it in System Settings > \
+                         Privacy & Security > Local Network. Background services started \
+                         outside a login session can be denied without a prompt. Retrying \
+                         every second."
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn announce_to_from_env() -> Option<Vec<SocketAddrV6>> {
+    let value = std::env::var(ANNOUNCE_TO_ENV).ok()?;
+    let targets = parse_announce_to(&value);
+    if targets.is_empty() {
+        warn!("{ANNOUNCE_TO_ENV}={value:?} names no IPv6 loopback address; using multicast");
+        return None;
+    }
+    info!("discovery announces to {targets:?} instead of multicast ({ANNOUNCE_TO_ENV})");
+    Some(targets)
+}
+
+fn parse_announce_to(value: &str) -> Vec<SocketAddrV6> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            part.parse::<SocketAddrV6>()
+                .inspect_err(|e| warn!("ignoring {ANNOUNCE_TO_ENV} entry {part:?}: {e}"))
+                .ok()
+        })
+        .filter(|addr| {
+            let loopback = addr.ip().is_loopback();
+            if !loopback {
+                warn!("ignoring {ANNOUNCE_TO_ENV} entry {addr}: not a loopback address");
+            }
+            loopback
+        })
+        .collect()
+}
+
+/// Ignores peers for a while after this process stalled (see `HOLD_OFF`).
+#[derive(Debug, Default)]
+struct StallGuard {
+    /// The previous tick
+    last_tick: Option<Now>,
+    held_off_until: Option<Instant>,
+}
+
+impl StallGuard {
+    /// Called on every tick. When it was late enough to be a stall (the membership's rule, a
+    /// sleep included), holds off and returns how late it was.
+    fn on_tick(&mut self, now: Now) -> Option<Duration> {
+        let late = self
+            .last_tick
+            .replace(now)
+            .and_then(|before| stall(before, now))?;
+        self.held_off_until = Some(now.awake + HOLD_OFF);
+        Some(late)
+    }
+
+    fn holding_off(&mut self, now: Instant) -> bool {
+        match self.held_off_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                info!("resuming peer discovery");
+                self.held_off_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// Rate-limits the notice that an exo of another version or namespace is on the network: a
+/// node sends a Hello every second from each of its interfaces.
+#[derive(Default)]
+struct OtherClusterNotice {
+    last: Option<Instant>,
+}
+
+impl OtherClusterNotice {
+    fn due(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(last) if now.duration_since(last) < OTHER_CLUSTER_NOTICE_INTERVAL => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Send `buf` to every address, returning an error only if nothing could be sent.
+///
+/// Failed addresses are not dropped: macOS returns EHOSTUNREACH while Local Network access
+/// is denied or its prompt is still pending, and an interface may simply not have a route
+/// yet. Retrying on the next tick lets discovery recover on its own once sending works.
+async fn send_to_all(sock: &UdpSocket, buf: &[u8], addrs: &[SocketAddrV6]) -> io::Result<()> {
+    let mut last_err = None;
+    let mut sent_any = false;
+    for addr in addrs {
+        match sock.send_to(buf, addr).await {
+            Ok(bytes) => {
+                sent_any = true;
+                trace!("sent {bytes} to {addr}");
+            }
+            Err(e) => {
+                debug!("failed to reach {addr}: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    match last_err {
+        Some(e) if !sent_any => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The nonces of our last few Hellos.
+#[derive(Default)]
+struct RecentNonces(VecDeque<[u8; 8]>);
+
+impl RecentNonces {
+    fn push(&mut self, nonce: [u8; 8]) {
+        if self.0.len() == RECENT_NONCES {
+            self.0.pop_front();
+        }
+        self.0.push_back(nonce);
+    }
+
+    fn contains(&self, nonce: [u8; 8]) -> bool {
+        self.0.contains(&nonce)
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+// packet & version
+pub enum Kind {
+    Hello = 0,
+    WhatsUp = 1,
+}
+
+pub struct UnknownKind;
+impl TryFrom<u8> for Kind {
+    type Error = UnknownKind;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Hello),
+            1 => Ok(Self::WhatsUp),
+            _ => Err(UnknownKind),
+        }
+    }
+}
+
+pub trait Message: Pod {
+    const KIND: Kind;
+}
+// should be part of the Message trait, but const in traits isnt stabilized. this lets alloc :: Self -> [u8; Self::buf_size()]
+macro_rules! impl_alloc {
+    ($a:ident) => {
+        impl $a {
+            const fn buf_size() -> usize {
+                size_of::<Header>() + size_of::<Self>()
+            }
+            pub fn alloc(self) -> [u8; Self::buf_size()] {
+                let mut buf = [0u8; Self::buf_size()];
+                buf[0..size_of::<Header>()].copy_from_slice(bytemuck::bytes_of(&Header {
+                    magic: MAGIC,
+                    kind: Self::KIND as u8,
+                }));
+                buf[size_of::<Header>()..Self::buf_size()]
+                    .copy_from_slice(bytemuck::bytes_of(&self));
+                buf
+            }
+        }
+    };
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Header {
+    magic: [u8; 3],
+    kind: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Hello {
+    pub nonce: [u8; 8],
+    pub namespace: [u8; 8],
+}
+impl Message for Hello {
+    const KIND: Kind = Kind::Hello;
+}
+impl_alloc!(Hello);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct WhatsUp {
+    pub nonce: [u8; 8],
+    pub zid: [u8; 16],
+    pub port_le: [u8; 2],
+}
+impl Message for WhatsUp {
+    const KIND: Kind = Kind::WhatsUp;
+}
+impl_alloc!(WhatsUp);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ticks at `start`, then once more `by` later on the awake clock and `with_sleep` later on
+    /// the clock that counts sleep; returns whether the second was a stall
+    fn second_tick_stalls(
+        guard: &mut StallGuard,
+        start: Now,
+        by: Duration,
+        with_sleep: Duration,
+    ) -> bool {
+        assert_eq!(guard.on_tick(start), None, "the first tick is never late");
+        let later = Now {
+            awake: start.awake + by,
+            with_sleep: start.with_sleep + with_sleep,
+            wall: start.wall + with_sleep,
+        };
+        guard.on_tick(later).is_some()
+    }
+
+    #[test]
+    fn a_late_tick_holds_off_peers_for_a_while() {
+        let start = Now::read();
+        let mut guard = StallGuard::default();
+        let on_time = Duration::from_millis(1500);
+        assert!(!second_tick_stalls(&mut guard, start, on_time, on_time));
+        assert!(!guard.holding_off(start.awake));
+
+        let mut guard = StallGuard::default();
+        let frozen = Duration::from_secs(30);
+        assert!(second_tick_stalls(&mut guard, start, frozen, frozen));
+        let resumed = start.awake + frozen;
+        assert!(guard.holding_off(resumed));
+        assert!(guard.holding_off(resumed + HOLD_OFF.saturating_sub(Duration::from_millis(1))));
+        assert!(!guard.holding_off(resumed + HOLD_OFF));
+        assert!(!guard.holding_off(resumed + HOLD_OFF * 2));
+    }
+
+    #[test]
+    fn a_sleep_holds_off_peers_too() {
+        // The machine slept a minute: the awake clock moved on by one tick only. Discovery
+        // used to read that clock alone, so it didn't hold off after a real sleep.
+        let mut guard = StallGuard::default();
+        assert!(second_tick_stalls(
+            &mut guard,
+            Now::read(),
+            TICK,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn a_wall_clock_set_doesnt_hold_off() {
+        let start = Now::read();
+        let mut guard = StallGuard::default();
+        assert_eq!(guard.on_tick(start), None);
+        let later = Now {
+            awake: start.awake + TICK,
+            with_sleep: start.with_sleep + TICK,
+            wall: start.wall + Duration::from_secs(3600),
+        };
+        assert_eq!(guard.on_tick(later), None);
+    }
+
+    #[test]
+    fn says_another_cluster_is_there_once_per_interval() {
+        let mut notice = OtherClusterNotice::default();
+        let start = Instant::now();
+        assert!(notice.due(start));
+        assert!(!notice.due(start + Duration::from_secs(1)));
+        assert!(!notice.due(start + OTHER_CLUSTER_NOTICE_INTERVAL - Duration::from_millis(1)));
+        assert!(notice.due(start + OTHER_CLUSTER_NOTICE_INTERVAL));
+        assert!(!notice.due(start + OTHER_CLUSTER_NOTICE_INTERVAL + Duration::from_secs(1)));
+    }
+
+    /// Discovery's packets are part of what exo nodes send each other. Changing them is a wire
+    /// change: bump WIRE_VERSION in src/exo/routing/wire.py, then update this test.
+    #[test]
+    fn the_discovery_packets_are_pinned() {
+        let hello = Hello {
+            nonce: [1; 8],
+            namespace: [2; 8],
+        }
+        .alloc();
+        let mut expected = b"EXO\0".to_vec();
+        expected.extend([1; 8]);
+        expected.extend([2; 8]);
+        assert_eq!(
+            hello.as_slice(),
+            expected,
+            "a wire change: bump WIRE_VERSION"
+        );
+
+        let whats_up = WhatsUp {
+            nonce: [3; 8],
+            zid: [4; 16],
+            port_le: 0x1234_u16.to_le_bytes(),
+        }
+        .alloc();
+        let mut expected_whats_up = b"EXO\x01".to_vec();
+        expected_whats_up.extend([3; 8]);
+        expected_whats_up.extend([4; 16]);
+        expected_whats_up.extend([0x34, 0x12]);
+        assert_eq!(
+            whats_up.as_slice(),
+            expected_whats_up,
+            "a wire change: bump WIRE_VERSION"
+        );
+    }
+
+    #[test]
+    fn announce_to_takes_ipv6_loopback_addresses_and_skips_the_rest() {
+        let targets = parse_announce_to(
+            " [::1]:40000, nonsense, 127.0.0.1:5,[::1]:40001,[2001:db8::1]:40002,[fe80::1%1]:3,",
+        );
+        assert_eq!(
+            targets,
+            vec![
+                SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40000, 0, 0),
+                SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40001, 0, 0),
+            ]
+        );
+        assert!(parse_announce_to("").is_empty());
+    }
+
+    #[test]
+    fn remembers_only_the_most_recent_nonces() {
+        let mut recent = RecentNonces::default();
+        let nonces: Vec<[u8; 8]> = (0..=RECENT_NONCES as u8).map(|i| [i; 8]).collect();
+        for nonce in &nonces {
+            recent.push(*nonce);
+        }
+        assert!(!recent.contains(nonces[0]));
+        assert!(nonces[1..].iter().all(|nonce| recent.contains(*nonce)));
+    }
+
+    /// An address no packet can be sent to: the discovery group on an interface index that
+    /// doesn't exist.
+    fn unsendable() -> SocketAddrV6 {
+        SocketAddrV6::new(GROUP, 9, 0, u32::MAX)
+    }
+
+    /// A UDP socket on the IPv6 loopback, or `None` where there isn't one (some sandboxes).
+    async fn local_socket() -> Option<(UdpSocket, SocketAddrV6)> {
+        let sock = UdpSocket::bind("[::1]:0").await.ok()?;
+        match sock.local_addr().ok()? {
+            SocketAddr::V6(addr) => Some((sock, addr)),
+            SocketAddr::V4(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn errors_when_nothing_can_be_sent() {
+        let Some((sender, _)) = local_socket().await else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        assert!(
+            send_to_all(&sender, b"hello", &[unsendable()])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_working_address_is_enough() {
+        let (Some((sender, _)), Some((receiver, receiver_addr))) =
+            (local_socket().await, local_socket().await)
+        else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        let addrs = [unsendable(), receiver_addr];
+
+        send_to_all(&sender, b"hello", &addrs)
+            .await
+            .expect("send succeeds on the working address");
+
+        let mut buf = [0u8; 5];
+        let (len, _) = receiver.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..len], b"hello");
     }
 }

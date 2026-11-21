@@ -4,7 +4,7 @@ from uuid import uuid4
 from pydantic import GetCoreSchemaHandler, field_validator
 from pydantic_core import CoreSchema, core_schema
 
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.utils.pydantic_ext import FrozenModel
 
 
 class Id(str):
@@ -31,10 +31,22 @@ class SystemId(Id):
 
 class ModelId(Id):
     def normalize(self) -> str:
-        return self.replace("/", "--")
+        """This id as a single file or directory name (e.g. the model's folder).
+
+        Raises ValueError for ids that would name the parent or current directory,
+        so a model id can never make a path escape the directory it is joined to.
+        """
+        name = self.replace("/", "--")
+        if name in ("", ".", ".."):
+            raise ValueError(f"{str(self)!r} is not a valid model id")
+        return name
 
     def short(self) -> str:
         return self.split("/")[-1]
+
+
+class DeploymentId(Id):
+    """A model a user launched, which the cluster keeps running (exo.shared.types.deployments)"""
 
 
 class CommandId(Id):
@@ -59,12 +71,12 @@ class TruncatingString(str):
         )
 
 
-class SessionId(CamelCaseModel):
+class SessionId(FrozenModel):
     master_node_id: NodeId
     election_clock: int
 
 
-class Host(CamelCaseModel):
+class Host(FrozenModel):
     ip: str
     port: int
 

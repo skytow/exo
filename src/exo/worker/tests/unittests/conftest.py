@@ -1,9 +1,10 @@
 from dataclasses import dataclass, field
 
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.types.backends import Backend
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
-from exo.shared.types.tasks import BaseTask, TaskId
+from exo.shared.types.tasks import BaseTask, Task, TaskId
 from exo.shared.types.worker.instances import (
     BoundInstance,
     Instance,
@@ -20,8 +21,12 @@ class FakeRunnerSupervisor:
     bound_instance: BoundInstance
     status: RunnerStatus
     completed: set[TaskId] = field(default_factory=set)
-    in_progress: set[TaskId] = field(default_factory=set)
+    in_progress: dict[TaskId, Task] = field(default_factory=dict)
+    cancelled: set[TaskId] = field(default_factory=set)
     pending: dict[TaskId, object] = field(default_factory=dict)
+    awaiting_acknowledgement: bool = False
+    stopping: bool = False
+    peer_went: bool = False
 
 
 class OtherTask(BaseTask):
@@ -41,6 +46,7 @@ def get_pipeline_shard_metadata(
             hidden_size=2048,
             supports_tensor=False,
             tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
         ),
         device_rank=device_rank,
         world_size=world_size,
