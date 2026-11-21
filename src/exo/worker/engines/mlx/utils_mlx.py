@@ -41,7 +41,7 @@ from mlx_lm.utils import load_model
 from pydantic import RootModel
 
 from exo.download.download_utils import build_model_path
-from exo.shared.types.common import Host
+from exo.shared.types.common import Host, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.mlx import Model
 from exo.shared.types.tasks import TaskId, TextGeneration
@@ -82,10 +82,36 @@ def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
     )
 
 
-class HostList(RootModel[list[str]]):
+class HostList(RootModel[list[list[str]]]):
     @classmethod
-    def from_hosts(cls, hosts: list[Host]) -> "HostList":
-        return cls(root=[str(host) for host in hosts])
+    def from_hosts_by_node(
+        cls, hosts_by_node: dict[NodeId, list[Host]], cycle: list[NodeId]
+    ) -> "HostList":
+        """Build the 2D hostfile array expected by MLX ring backend.
+
+        MLX load_nodes() expects [[addr, ...], [addr, ...]] where index i
+        corresponds to rank i. Each rank calls accept on nodes[rank] and
+        connects to nodes[(rank+1) % size].
+
+        The per-node host list (hosts_by_node) has the node's own bind
+        address at its rank index and the IPs of neighbors at their indices.
+        We need each rank's entry to contain the address OTHER ranks use to
+        connect TO this rank, which is the entry at this rank's index in a
+        neighbor's host list.
+        """
+        world_size = len(cycle)
+        nodes: list[list[str]] = []
+        for target_rank in range(world_size):
+            # Find the right neighbor's view of target_rank's address.
+            # Right neighbor of target_rank has rank (target_rank + 1) % size.
+            neighbor_rank = (target_rank + 1) % world_size
+            neighbor_nid = cycle[neighbor_rank]
+            neighbor_hosts = hosts_by_node[neighbor_nid]
+            # neighbor_hosts[target_rank] is the IP that neighbor uses to
+            # connect to target_rank — this IS target_rank's listen address.
+            addr = str(neighbor_hosts[target_rank])
+            nodes.append([addr])
+        return cls(root=nodes)
 
 
 def mlx_distributed_init(
@@ -104,8 +130,10 @@ def mlx_distributed_init(
         # TODO: singleton instances
         match bound_instance.instance:
             case MlxRingInstance(hosts_by_node=hosts_by_node, ephemeral_port=_):
-                hosts_for_node = hosts_by_node[bound_instance.bound_node_id]
-                hosts_json = HostList.from_hosts(hosts_for_node).model_dump_json()
+                cycle = [
+                    n for n in bound_instance.instance.shard_assignments.node_to_runner
+                ]
+                hosts_json = HostList.from_hosts_by_node(hosts_by_node, cycle).model_dump_json()
 
                 with open(coordination_file, "w") as f:
                     _ = f.write(hosts_json)
